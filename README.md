@@ -1,4 +1,4 @@
-# Parallel Diffusion Sampling with Low-Dimensional Alignment <br><sub>Official implementation</sub>
+# Parallel Diffusion Solver via Residual Dirichlet Policy Optimization <br><sub>Official implementation</sub>
 
 <div align="center">
 <img src="assets/sd3_1024.png" alt="SD3-1024 samples" width="500">
