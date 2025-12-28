@@ -22,6 +22,8 @@ def get_schedule(num_steps, sigma_min, sigma_max, device=None, schedule_type='po
     Returns:
         a PyTorch tensor with shape [num_steps].
     """
+    base_net = net.module if hasattr(net, "module") else net
+
     if schedule_type == 'polynomial':
         step_indices = torch.arange(num_steps, device=device)
         t_steps = (sigma_max ** (1 / schedule_rho) + step_indices / (num_steps - 1) * (sigma_min ** (1 / schedule_rho) - sigma_max ** (1 / schedule_rho))) ** schedule_rho
@@ -40,12 +42,18 @@ def get_schedule(num_steps, sigma_min, sigma_max, device=None, schedule_type='po
         t_steps_temp = (1 + step_indices / (num_steps - 1) * (epsilon_s ** (1 / schedule_rho) - 1)) ** schedule_rho
         t_steps = vp_sigma(vp_beta_d.clone().detach().cpu(), vp_beta_min.clone().detach().cpu())(t_steps_temp.clone().detach().cpu())
     elif schedule_type == 'discrete':
-        assert net is not None
-        t_steps_min = net.sigma_inv(torch.tensor(sigma_min, device=device))
-        t_steps_max = net.sigma_inv(torch.tensor(sigma_max, device=device))
+        assert base_net is not None
+        t_steps_min = base_net.sigma_inv(torch.tensor(sigma_min, device=device))
+        t_steps_max = base_net.sigma_inv(torch.tensor(sigma_max, device=device))
         step_indices = torch.arange(num_steps, device=device)
         t_steps_temp = (t_steps_max + step_indices / (num_steps - 1) * (t_steps_min ** (1 / schedule_rho) - t_steps_max)) ** schedule_rho
-        t_steps = net.sigma(t_steps_temp)
+        t_steps = base_net.sigma(t_steps_temp)
+    elif schedule_type == 'flowmatch':
+        if base_net is None or getattr(base_net, "backend", None) != "sd3":
+            raise ValueError("flowmatch schedule requires an SD3 backend instance.")
+        if not hasattr(base_net, "make_flowmatch_schedule"):
+            raise ValueError("SD3 backend does not expose make_flowmatch_schedule.")
+        t_steps = base_net.make_flowmatch_schedule(num_steps, device=device)
     else:
         raise ValueError("Got wrong schedule type {}".format(schedule_type))
     return t_steps.to(device)
@@ -157,5 +165,3 @@ def multistep_dpm_solver_third_update(x, model_prev_list, t_prev_list, t, predic
     else:
         x_t =  x - scale * (t * phi_1 * model_prev_0 + t * phi_2 * D1 + t * phi_3 * D2)
     return x_t
-
-

@@ -1,95 +1,112 @@
-#!/bin/bash
+# RL Train
 
-###############################
-### A. Train EPD Predictor  ###
-###############################
+## SD1.5
+torchrun --master_port=23123 --nproc_per_node=1 -m training.ppo.launch \
+    --config training/ppo/cfgs/sd15.yaml
 
-# Hardware Note: 
-# - Use 4xA800 for LSUN_Bedroom_ldm & Stable Diffusion
-# - Use 4xRTX4090 for other experiments
-# - Adjust batch size according to your GPU memory
+### You can replace "/path/to/local/sd3-model" with your local SD3 Medium folder or checkpoint, to avoid downloads.
 
-# Note on num_steps:
-# - Original steps = num_steps (N)
-# - Final steps = 2*(N-1) (EPD inserts intermediate steps)
-# - NFE = 5 (afs=True) or 6 (afs=False)
+## SD3-Medium (512x512)
+torchrun --master_port=22222 --nproc_per_node=1 -m training.ppo.launch \
+    --config training/ppo/cfgs/sd3_512.yaml \
+    --override model.backend_options.model_name_or_path=/path/to/local/sd3-model
 
-train_model() {
-    torchrun --standalone --nproc_per_node=4 --master_port=11111 \
-        train.py \
-        --dataset_name="$1" \
-        --batch="$2" \
-        --total_kimg="$3" \
-        $SOLVER_FLAGS \
-        $SCHEDULE_FLAGS \
-        $ADDITIONAL_FLAGS \
-        $GUIDANCE_FLAGS
+## SD3-Medium (1024x1024)
+torchrun --master_port=12345 --nproc_per_node=1 -m training.ppo.launch \
+    --config training/ppo/cfgs/sd3_1024.yaml \
+    --override model.backend_options.model_name_or_path=/path/to/local/sd3-model
+
+# Sample
+
+## Export the EPD predictor
+python -m training.ppo.export_epd_predictor \
+    exps/[xxxxxx] \
+    --checkpoint checkpoints/policy-step[xxxxxx].pt
+
+
+## SD1.5
+MASTER_PORT=12345 python sample.py \
+    --predictor_path exps/[xxxxxx]/export/network-snapshot-export-step000005.pkl \
+    --prompt-file src/prompts/test.txt \
+    --seeds "0-999" \
+    --batch 16 \
+    --outdir samples/sd15
+
+MASTER_PORT=55551 python sample.py \
+    --predictor_path exps/sd15/sd15-best.pkl \
+    --prompt-file src/prompts/test.txt \
+    --seeds "0-999" \
+    --batch 16 \
+    --outdir samples/sd15
+
+## SD3-Medium
+python sample_sd3.py --predictor exps/sd3-1024/sd3-1024-best.pkl \
+    --seeds "0" \
+    --outdir samples/sd3 \
+    --prompt "A very big apple." \
+    --backend-config "{\"model_name_or_path\":\"/path/to/local/sd3-model\"}"
+
+python sample_sd3.py --predictor exps/sd3-512/sd3-512-best.pkl \
+    --prompt-file src/prompts/test.txt \
+    --seeds "0-9" \
+    --max-batch-size 1 \
+    --outdir samples/sd3_epd_9_1024_8000 \
+    --backend-config "{\"model_name_or_path\":\"/path/to/local/sd3-model\"}"
+
+# Evaluation 
+score_all_metrics() {
+    local name="$1"
+    if [ -z "$name" ]; then
+        echo "Usage: score_all_metrics <images_subdir_under_samples>"
+        return 1
+    fi
+
+    local image_dir="samples/${name}"
+    local prefix="${name}"
+
+    mkdir -p results
+
+    python -m training.ppo.scripts.score_clip \
+        --images "${image_dir}" \
+        --pattern "**/*.png" \
+        --prompts src/prompts/test.txt \
+        --weights weights/clip \
+        --output-json "results/${prefix}_clip.json"
+
+    python -m training.ppo.scripts.score_hps \
+        --images "${image_dir}" \
+        --pattern "**/*.png" \
+        --prompts src/prompts/test.txt \
+        --weights weights/HPS_v2.1_compressed.pt \
+        --output-json "results/${prefix}_hps.json"
+
+    python -m training.ppo.scripts.score_aesthetic \
+        --images "${image_dir}" \
+        --pattern "**/*.png" \
+        --prompts src/prompts/test.txt \
+        --weights weights/sac+logos+ava1-l14-linearMSE.pth \
+        --output-json "results/${prefix}_aesthetic.json"
+
+    python -m training.ppo.scripts.score_pick \
+        --images "${image_dir}" \
+        --pattern "**/*.png" \
+        --prompts src/prompts/test.txt \
+        --weights weights/PickScore_v1 \
+        --output-json "results/${prefix}_pick.json"
+
+    python -m training.ppo.scripts.score_imagereward \
+        --images "${image_dir}" \
+        --pattern "**/*.png" \
+        --prompts src/prompts/test.txt \
+        --weights weights/ImageReward-v1.0.pt \
+        --output-json "results/${prefix}_imagereward.json"
+
+    python -m training.ppo.scripts.score_mps \
+        --images "${image_dir}" \
+        --pattern "**/*.png" \
+        --prompts src/prompts/test.txt \
+        --weights weights/MPS_overall_checkpoint.pth \
+        --output-json "results/${prefix}_mps.json"
 }
 
-## A.1 CIFAR-10 ##
-SOLVER_FLAGS="--sampler_stu=epd --sampler_tea=dpm --num_steps=4 --M=3 --afs=True --scale_dir=0.05 --scale_time=0.05 --seed=0 --lr 0.2 --coslr"
-SCHEDULE_FLAGS="--schedule_type=time_uniform --schedule_rho=1"
-train_model "cifar10" 128 10
-
-SOLVER_FLAGS="--sampler_stu=ipndm --sampler_tea=ipndm --num_steps=4 --M=3 --afs=True --scale_dir=0.05 --scale_time=0.2 --seed=0 --lr 0.2 --coslr"
-SCHEDULE_FLAGS="--schedule_type=polynomial --schedule_rho=7"
-ADDITIONAL_FLAGS="--max_order=4"
-train_model "cifar10" 128 10
-
-## A.2 FFHQ ##
-SOLVER_FLAGS="--sampler_stu=epd --sampler_tea=dpm --num_steps=4 --M=3 --afs=True --scale_dir=0.05 --scale_time=0.05 --seed=0 --lr 0.2 --coslr"
-SCHEDULE_FLAGS="--schedule_type=time_uniform --schedule_rho=1"
-train_model "ffhq" 64 10
-
-## A.3 ImageNet-64 ##
-SOLVER_FLAGS="--sampler_stu=epd --sampler_tea=dpm --num_steps=4 --M=1 --afs=True --scale_dir=0.05 --scale_time=0.05 --seed=0 --lr 0.2 --coslr"
-SCHEDULE_FLAGS="--schedule_type=time_uniform --schedule_rho=1"
-train_model "imagenet64" 64 10
-
-## A.4 LSUN Bedroom (LDM) ##
-SOLVER_FLAGS="--sampler_stu=epd --sampler_tea=dpm --num_steps=4 --M=3 --afs=True --scale_dir=0.1 --scale_time=0 --seed=0 --lr 0.02 --coslr"
-SCHEDULE_FLAGS="--schedule_type=discrete --schedule_rho=1"
-ADDITIONAL_FLAGS="--max_order=3 --predict_x0=False --lower_order_final=True"
-GUIDANCE_FLAGS="--guidance_type=uncond --guidance_rate=1"
-train_model "lsun_bedroom_ldm" 64 10
-
-## A.5 Stable Diffusion ##
-# Note: NFE doubles due to classifier-free guidance
-SOLVER_FLAGS="--sampler_stu=epd --sampler_tea=dpm --num_steps=4 --M=3 --afs=True --scale_dir=0.05 --scale_time=0.2 --seed=0 --lr 0.01"
-SCHEDULE_FLAGS="--schedule_type=discrete --schedule_rho=1"
-ADDITIONAL_FLAGS="--max_order=2 --predict_x0=False --lower_order_final=True"
-GUIDANCE_FLAGS="--guidance_type=cfg --guidance_rate=7.5"
-train_model "ms_coco" 32 5
-
-#################################
-### B. Generate Samples for FID ###
-#################################
-
-# Trained predictors are saved in ./exps/ (5-digit experiment numbers)
-# Use either:
-# --predictor_path=/full/path
-# --predictor_path=EXP_NUMBER (e.g., 00000)
-
-generate_samples() {
-    torchrun --standalone --nproc_per_node=4 --master_port=22222 \
-        sample.py \
-        --predictor_path="$1" \
-        --batch="$2" \
-        --seeds="$3"
-}
-
-## B.1 Standard Datasets ##
-generate_samples 0 128 "0-49999"
-
-## B.2 Stable Diffusion ##
-generate_samples 0 8 "0-29999"
-
-##########################
-### C. Evaluation ###
-##########################
-
-## C.1 FID Calculation ##
-python fid.py calc \
-    --images="path/to/generated/images" \
-    --ref="path/to/fid/statistics"
-
+score_all_metrics ...

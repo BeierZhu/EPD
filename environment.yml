@@ -1,4 +1,4 @@
-name: edm
+name: epd
 channels:
   - pytorch
   - nvidia

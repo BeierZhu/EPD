@@ -682,7 +682,7 @@ class CFGPrecond(torch.nn.Module):
             F_x = self.noise_pred_fn(c_in.reshape(-1,1,1,1) * x, c_noise)
         elif self.guidance_type == "classifier-free":
             if self.guidance_rate == 1. or unconditional_condition is None:
-                F_x = self.noise_pred_fn(c_in * x, c_noise, cond=condition)
+                F_x = self.noise_pred_fn(c_in.reshape(-1,1,1,1) * x, c_noise, cond=condition)
             else:
                 x_in = torch.cat([c_in.reshape(-1,1,1,1) * x] * 2)
                 t_in = torch.cat([c_noise] * 2)

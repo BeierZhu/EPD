@@ -15,8 +15,14 @@ def get_solver_fn(solver_name):
         solver_fn = solvers.ipndm_sampler
     elif solver_name == 'dpm':
         solver_fn = solvers.dpm_sampler
+    elif solver_name == 'dpm2':
+        solver_fn = solvers.dpm_sampler_2
     elif solver_name == 'heun':
         solver_fn = solvers.heun_sampler
+    elif solver_name == 'edm':
+        solver_fn = solvers.edm_sampler
+    elif solver_name == 'ddim':
+        solver_fn = solvers.ddim_sampler
     elif solver_name == 'epd_parallel':
         solver_fn = solvers.epd_parallel_sampler
     else:

@@ -1,0 +1,63 @@
+run:
+  output_root: "exps"
+  run_name: "sd15"
+  seed: 0
+
+data:
+  predictor_snapshot: "exps/sd15/sd15-distilled.pkl"
+  prompt_csv: null
+
+model:
+  dataset_name: "ms_coco"
+  guidance_type: "cfg"
+  guidance_rate: 7.5
+  schedule_type: "discrete"
+  schedule_rho: 1.0
+  num_steps: null
+  num_points: null
+  backend: "ldm"
+  backend_options: {}
+
+reward:
+  type: "multi"
+  weights_path: "weights/HPS_v2.1_compressed.pt"
+  batch_size: 4
+  enable_amp: true
+  cache_dir: "weights"
+  multi:
+    weights:
+      hps: 1.0
+      pickscore: 0.0
+      imagereward: 0.0
+      clip: 0.0
+      aesthetic: 0.0
+    pickscore:
+      model: "yuvalkirstain/PickScore_v1"
+      processor: "laion/CLIP-ViT-H-14-laion2B-s32B-b79K"
+    imagereward:
+      checkpoint: "weights/ImageReward.pt"
+      med_config: "weights/med_config.json"
+      cache_dir: "weights"
+    clip:
+      cache_dir: "weights/clip"
+    aesthetic:
+      predictor_path: "weights/sac+logos+ava1-l14-linearMSE.pth"
+      clip_path: "weights/clip"
+
+ppo:
+  rollout_batch_size: 8
+  rloo_k: 4
+  ppo_epochs: 1
+  minibatch_size: 4
+  learning_rate: 7e-5
+  clip_range: 0.2
+  kl_coef: 0.0
+  entropy_coef: 0.0
+  max_grad_norm: 1.0
+  decode_rgb: true
+  steps: 99999
+  dirichlet_concentration: 20
+
+logging:
+  log_interval: 1
+  save_interval: 500
