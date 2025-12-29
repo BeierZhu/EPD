@@ -1,171 +1,176 @@
-## [ICCV 2025] Distilling Parallel Gradients for Fast ODE Solvers of Diffusion Models<br><sub>Official implementation of the ICCV 2025 paper</sub>
-
+<h1 align="center">
+  Parallel Diffusion Solver via<br> Residual Dirichlet Policy Optimization
+</h1>
 <div align="center">
-<img src="assets/sd.png" alt="teaser" width="500">
+  <a href='https://arxiv.org'><img src='https://img.shields.io/badge/Paper%20(arXiv)-2512.xxxxx-red?logo=arxiv'></a>  &nbsp;
+  <a href='https://epd-solver.github.io/'><img src='https://img.shields.io/badge/Website-green?logo=homepage&logoColor=white'></a> &nbsp;
 </div>
 
+## Algorithm Overview
 <div align="center">
-
-<a href="https://arxiv.org/pdf/2507.14797" style="display: inline-block;">
-    <img src="https://img.shields.io/badge/arXiv%20paper-2507.08396-b31b1b.svg" alt="arXiv" style="height: 20px; vertical-align: middle;">
-</a>&nbsp;
-
+<img src="assets/pipeline.png" alt="Training Pipeline" width="600">
 </div>
 
-**Abstract**: Diffusion models (DMs) have achieved state-of-the-art generative performance but suffer from high sampling latency due to their sequential denoising nature. Existing solver-based acceleration methods often face image quality degradation under a low-latency budget. In this paper, we propose the **E**nsemble **P**arallel **D**irection solver (dubbed as $\texttt{EPD-Solver}$), a novel ODE solver that mitigates truncation errors by incorporating multiple parallel gradient evaluations in each ODE step. Importantly, since the additional gradient computations are independent, they can be fully parallelized, preserving low-latency sampling. Our method optimizes a small set of learnable parameters in a distillation fashion, ensuring minimal training overhead. In addition, our method can serve as a plugin to improve existing ODE samplers. Extensive experiments on various image synthesis benchmarks demonstrate the effectiveness of our $\texttt{EPD-Solver}$ in achieving high-quality and low-latency sampling. For example, at the same latency level of 5 NFE, EPD achieves an FID of 4.47 on CIFAR-10, 7.97 on FFHQ, 8.17 on ImageNet, and 8.26 on LSUN Bedroom, surpassing existing learning-based solvers by a significant margin.
+**EPD-Solver** (Ensemble Parallel Direction) mitigates truncation errors in diffusion sampling by leveraging **parallel gradient evaluations** within a single step. We introduce a novel two-stage optimization framework that aligns the solver with human preferences without fine-tuning the heavy diffusion backbone.
 
-<img src="assets/teaser.jpg" alt="comparison" width="800" style="display: block; margin: auto;">
+### 1. Parallel Gradient Estimation
+Instead of sequential evaluations, EPD-Solver computes gradients at multiple learned intermediate timesteps ($\tau_n^k$) in parallel. By aggregating these gradients via a simplex-weighted sum, it achieves a higher-order approximation of the integral direction with negligible latency overhead on modern GPUs.
 
-## Requirements
-- This codebase mainly refers to the codebase of [EDM](https://github.com/NVlabs/edm). To install the required packages, please refer to the [EDM](https://github.com/NVlabs/edm) codebase.
-- This codebase supports the pre-trained diffusion models from [EDM](https://github.com/NVlabs/edm), [ADM](https://github.com/openai/guided-diffusion), [Consistency models](https://github.com/openai/consistency_models), [LDM](https://github.com/CompVis/latent-diffusion) and [Stable Diffusion](https://github.com/CompVis/stable-diffusion). When you want to load the pre-trained diffusion models from these codebases, please refer to the corresponding codebases for package installation.
+### 2. Two-Stage Optimization
+* **Stage 1: Distillation-Based Initialization** 
+    We first distill a few-step student solver by minimizing the trajectory error against a high-fidelity teacher (e.g., DPM-Solver). This provides a robust initialization that captures the trajectory curvature.
 
-## Getting Started
+* **Stage 2: Residual Dirichlet Policy Optimization (RDPO)** 
+    We reformulate the solver as a **stochastic Dirichlet policy**. Using a lightweight PPO variant, we fine-tune the solver's low-dimensional parameters (time segments and weights) to maximize human-aligned rewards (e.g., HPSv2, ImageReward). This ensures high perceptual quality and semantic alignment even at low NFEs (e.g., 20 steps).
 
-## EPD Implementation Guide
+## Installation
 
-- Run the commands in [launch.sh](./launch.sh) for training, sampling and evaluation using our recommended configurations. 
-- All commands support multi-GPU parallelization by adjusting the `--nproc_per_node` parameter. 
-- Complete parameter descriptions are available in the next section.
+1. **Create Environment**
+   ```bash
+   conda env create -f environment.yml -n epd
+   conda activate epd
+   ```
+2. **Install Dependencies**
+    ```bash
+    # Core dependencies
+    pip install omegaconf gdown lightning fairscale piq accelerator timm einops kornia HPSv2
+    pip install --upgrade diffusers[torch]
 
-### Setup Notes:
-- Required models will be automatically downloaded to `"./src/dataset_name"`
-- Default configurations use 1 4090GPU for CIFAR10, FFHQ, ImageNet, and 4 A100 GPUs for LSUN Bedroom and Stable Diffusion
-- Adjust batch size according to your hardware capabilities
+    # CLIP & Transformers
+    pip install git+[https://github.com/openai/CLIP.git](https://github.com/openai/CLIP.git)
+    pip install transformers
+    pip install -e git+[https://github.com/CompVis/taming-transformers.git@master#egg=taming-transformers](https://github.com/CompVis/taming-transformers.git@master#egg=taming-transformers)
+    ```
 
-**Important Note**:  
-The `num_steps` parameter specifies the number of original timestamps. EPD inserts new timestamps between existing ones, so:
-- When `num_steps=4`, the total becomes 7 timestamps (6 sampling steps)
-- NFE = 5 if `afs==True`, otherwise 6
+3. **Setup Environment Variables Important: Run this before training or inference.**
 
-### Example Commands:
+    ```bash
+    export PYTHONPATH="$PWD/training/ppo/reward_models/HPSv2:$PWD/src/taming-transformers:$PYTHONPATH"
+    ```
+
+## Model Zoo & Checkpoints
+
+We provide pre-trained predictors (**Stage 1: Distilled**) and RL-finetuned solvers (**Stage 2: Best**).
+Stage 2 models are optimized using Residual Dirichlet Policy Optimization for better human preference alignment.
+
+| Model | Resolution | Type | Download |
+| :--- | :---: | :---: | :---: |
+| **Stable Diffusion v1.5** | 512x512 | RL-Best (Stage 2) | [sd15-best.pkl](./exps/sd15/sd15-best.pkl) |
+| | | Distilled (Stage 1) | [sd15-distilled.pkl](./exps/sd15/sd15-distilled.pkl) |
+| **SD3-Medium** | 1024x1024 | RL-Best (Stage 2) | [sd3-1024-best.pkl](./exps/sd3-1024/sd3-1024-best.pkl) |
+| | | Distilled (Stage 1) | [sd3-1024-distilled.pkl](./exps/sd3-1024/sd3-1024-distilled.pkl) |
+| **SD3-Medium** | 512x512 | RL-Best (Stage 2) | [sd3-512-best.pkl](./exps/sd3-512/sd3-512-best.pkl) |
+| | | Distilled (Stage 1) | [sd3-512-distilled.pkl](./exps/sd3-512/sd3-512-distilled.pkl) |
+
+We also provide a detailed guide for each part below.
+
+### RDPO Training
+
+To train EPD-Solver using RDPO:
 
 ```bash
-# EPD-Solver Configuration
-SOLVER_FLAGS="--sampler_stu=epd --sampler_tea=heun --num_steps=4 --M=1 --afs=True --scale_dir=0.01 --scale_time=0"
-SCHEDULE_FLAGS="--schedule_type=time_uniform --schedule_rho=1"
-torchrun --standalone --nproc_per_node=4 --master_port=11111 \
-train.py --dataset_name="cifar10" --batch=128 --total_kimg=10 $SOLVER_FLAGS $SCHEDULE_FLAGS
+# Available configs: sd15.yaml, sd3_512.yaml, sd3_1024.yaml
+torchrun --master_port=12345 --nproc_per_node=1 -m training.ppo.launch \
+    --config training/ppo/cfgs/sd3_1024.yaml
 ```
 
-```.bash
-# Generate 50K samples for FID evaluation
-torchrun --standalone --nproc_per_node=1 --master_port=22222 \
-sample.py --predictor_path=0 --batch=128 --seeds="0-49999"
+**Note**: RDPO training was performed using a single NVIDIA H200 GPU. Refer to launch.sh for full scripts.
+
+### Inference
+To generate images with an EPD-Solver, use the examples below (replace checkpoint paths with your own exports as needed):
+
+```bash
+## SD1.5
+MASTER_PORT=12345 python sample.py \
+    --predictor_path exps/sd15/sd15-best.pkl \
+    --prompt-file src/prompts/test.txt \
+    --seeds "0-19" \
+    --batch 4 \
+    --outdir samples/sd15
+
+## SD3-Medium
+python sample_sd3.py --predictor exps/sd3-1024/sd3-1024-best.pkl \
+  --seeds "0" \
+  --outdir samples/sd3 \
+  --prompt "..."
 ```
 
-The generated images will be stored at ```"./samples"``` by default. To compute Fréchet inception distance (FID) for a given model and sampler, compare the generated 50k images against the dataset reference statistics using ```fid.py```:
+### Evaluation
 
-```.bash
-# FID evaluation
-python fid.py calc --images=path/to/images --ref=path/to/fid/stat
-```
-
+We provide six metrics to evaluate generated images: **HPSv2.1, PickScore, ImageReward, CLIP, Aesthetic, and MPS**. Please refer to the evaluation script section in [launch.sh](./launch.sh).
 
 ## Parameter Description
 
-| Category          | Parameter          | Default | Description |
-|-------------------|--------------------|---------|-------------|
-| **General Options** | `dataset_name`     | None    | Supported datasets: `['cifar10', 'ffhq', 'afhqv2', 'imagenet64', 'lsun_bedroom', 'imagenet256', 'lsun_bedroom_ldm', 'ms_coco']` |
-|                   | `predictor_path`   | None    | Path or experiment number of trained EPD predictor |
-|                   | `batch`            | 64      | Total batch size |
-|                   | `seeds`            | "0-63"  | Random seed range for image generation |
-|                   | `grid`             | False   | Organize output images in grid layout |
-|                   | `total_kimg`       | 10      | Training duration (in thousands of images) |
-|                   | `scale_dir`        | 0.05    | Gradient direction scale (`c_n` in paper). Range: `[1-scale_dir, 1+scale_dir]` |
-|                   | `scale_time`       | 0.05       | Input time scale (`a_n` in paper). Range: `[1-scale_time, 1+scale_time]` |
-| **Solver Flags**  | `sampler_stu`      | 'epd'   | Student solver: `['epd', 'ipndm']` |
-|                   | `sampler_tea`      | 'dpm'   | Teacher solver type |
-|                   | `num_steps`        | 4       | Initial timestamps for student solver. Final steps = `2*(num_steps-1)` (EPD inserts intermediate steps) |
-|                   | `M`                | 3       | Intermediate steps inserted between teacher solver steps |
-|                   | `afs`              | False   | Enable Accelerated First Step (saves initial model evaluation) |
-| **Schedule Flags**| `schedule_type`    | 'polynomial' | Time discretization: `['polynomial', 'logsnr', 'time_uniform', 'discrete']` |
-|                   | `schedule_rho`     | 7       | Time step exponent (required for `polynomial`, `time_uniform`, `discrete`) |
-| **Additional Flags** | `max_order`       | None    | Multi-step solver order: `1-4` for iPNDM, `1-3` for DPM-Solver++ |
-|                   | `predict_x0`       | True    | DPM-Solver++: Use data prediction formulation |
-|                   | `lower_order_final`| True    | DPM-Solver++: Reduce order at final sampling stages |
-| **Guidance Flags** | `guidance_type`    | None    | Guidance method: `['cg' (classifier), 'cfg' (classifier-free), 'uncond' (unconditional), None]` |
-|                   | `guidance_rate`    | None    | Guidance strength parameter |
-|                   | `prompt`           | None    | Text prompt for Stable Diffusion sampling |
+**Sampling (`sample.py`)**
 
-### Key Notes:
-1. **EPD Step Calculation**: When `num_steps=N`, total steps = `2*(N-1)` (EPD inserts intermediate steps)
-2. **Parameter Ranges**: 
-   - `scale_dir`: Typically small values (0.01-0.1)
-   - `scale_time`: 0 for no time scaling
-3. **Multi-GPU Support**: All commands support `--nproc_per_node` for parallel execution
+| Parameter | Default | What it controls |
+|-----------|---------|------------------|
+| `predictor_path` | required | EPD predictor snapshot (.pkl); numeric IDs auto-resolve to the latest matching checkpoint in `./exps`. |
+| `model_path` | None | (Reserved) optional backbone checkpoint override; currently unused because backbones auto-resolve from dataset tags. |
+| `max_batch_size` (`--batch`) | `64` | Per-process batch size; seeds are split across ranks. |
+| `seeds` | `0-63` | Seed list or range; determines how many images are generated. |
+| `prompt` | None | Single text prompt for all seeds; if omitted, falls back to `prompt-file` or MS-COCO eval captions for `dataset_name=ms_coco`. |
+| `prompt-file` | None | Text or CSV (column `text`) with prompts; used when `prompt` is empty. |
+| `backend` | Predictor metadata | Override backbone (`ldm`/`sd3`); defaults to what is stored in the predictor. |
+| `backend-config` | None | JSON object overriding backend options (e.g., SD3 resolution/torch_dtype/offload/token). |
+| `use_fp16` | `False` | Reserved flag for mixed precision (not currently wired). |
+| `return_inters` | `False` | Reserved flag for saving intermediates (not currently wired). |
+| `outdir` | Auto (`./samples/{dataset}` or `./samples/grids/{dataset}`) | Output root; falls back to a derived path when unset. |
+| `grid` | `False` | Save a grid per batch instead of per-image files. |
+| `subdirs` | `True` | When saving per-image files, create 1k-chunked subfolders. |
 
-## 🚀 Performance Highlights
-<img src="assets/fid.png" alt="fid" width="800" >
+**Sampling (`sample_sd3.py`)**
 
+| Parameter | Default | What it controls |
+|-----------|---------|------------------|
+| `predictor` | required | SD3 EPD predictor snapshot (.pkl). |
+| `seeds` | `0-3` | Seed list or range; determines how many images are generated. |
+| `prompt` | None | Single prompt for all seeds; if empty, uses `prompt-file` or falls back to empty prompts. |
+| `prompt-file` | None | Text/CSV file with prompts; repeats to match `seeds` length. |
+| `outdir` | `./samples/sd3_epd` | Output directory. |
+| `grid` | `False` | Save a grid per batch. |
+| `max-batch-size` | `4` | Per-batch sample count (`--max-batch-size`). |
+| `resolution` | Predictor/back-end config (512 or 1024) | Optional override; must match predictor metadata if set. |
 
-**Key Metric:** All results achieved at **5 NFE** (ultra-low latency)
+**Solver metadata (read from predictor checkpoints)**
 
-| Dataset       | FID   | Improvement |
-|---------------|-------|-------------|
-| `CIFAR-10`    | 4.33  | +34% over SOTA |
-| `FFHQ-64`     | 7.84  | +37% over SOTA | 
-| `ImageNet-64` | 6.35  | +41% over SOTA |
-| `LSUN Bedroom`| 7.52  | +43% over SOTA |
+| Parameter | Default source | Notes |
+|-----------|----------------|-------|
+| `dataset_name` | Predictor ckpt | Dataset tag (e.g., `ms_coco`); drives prompt fallback and output paths. |
+| `backend` / `backend_config` | Predictor ckpt | Backbone type plus stored options (resolution, flow-match params, offload/token settings for SD3, etc.). |
+| `num_steps` | Predictor ckpt | Inference steps; base NFE `2*(num_steps-1)` (minus one eval when `afs=True`, doubled again for CFG in ms_coco). |
+| `num_points` | Predictor ckpt | Number of intermediate points per step; used for NFE reporting/outdir naming. |
+| `guidance_type` / `guidance_rate` | Predictor ckpt | CFG sampling (e.g., 4.5 for SD3 PPO configs, 7.5 for SD1.5). |
+| `schedule_type` / `schedule_rho` | Predictor ckpt | `flowmatch` for SD3, `discrete` for SD1.5. |
+| `sigma_min` / `sigma_max` | Predictor or backend | Noise range passed to scheduler (falls back to backend defaults when unset). |
+| `flowmatch_mu` / `flowmatch_shift` | Predictor or backend | Flow-matching parameters used by SD3 schedules. |
+| `afs`, `max_order`, `predict_x0`, `lower_order_final` | Predictor ckpt | EPD/DPM solver behavior flags. |
 
+**RDPO Training configs (`training/ppo/cfgs/*.yaml`)**
 
-## Pre-trained EPD Predictors
+| Key | sd3_512 | sd3_1024 | sd15 | Purpose |
+|-----|---------|----------|------|---------|
+| `data.predictor_snapshot` | `exps/sd3-512/...-distilled.pkl` | `exps/sd3-1024/...-distilled.pkl` | `exps/sd15/...-distilled.pkl` | Starting EPD predictor. |
+| `model.backend` | `sd3` | `sd3` | `ldm` | Backbone family used during RL. |
+| `model.resolution` | `512` | `1024` | n/a | SD3 training resolution (LDM inherits from predictor/backbone). |
+| `model.schedule_type` | `flowmatch` | `flowmatch` | `discrete` | Diffusion schedule during RL. |
+| `model.guidance_rate` | `4.5` | `4.5` | `7.5` | CFG scale used while training the solver. |
+| `ppo.rollout_batch_size` | `16` | `8` | `8` | Samples per PPO rollout. |
+| `ppo.dirichlet_concentration` | `10` | `10` | `20` | Dirichlet policy concentration. |
+| `reward.batch_size` | `4` | `4` | `4` | Reward evaluation batch size. |
+| `reward.multi.weights` | `hps:1.0` (others 0) | same | same | Per-head reward weights. |
 
-We provide pre-trained EPD predictors for:
+Shared defaults across configs: `model.dataset_name=ms_coco`, `model.guidance_type=cfg`, `model.schedule_rho=1.0`, `model.num_steps/num_points/sigma_min/sigma_max` left `null` to inherit predictors/backends, `reward.type=multi`, `reward.enable_amp=true`, `reward.weights_path=weights/HPS_v2.1_compressed.pt`, `ppo.learning_rate=7e-5`, `ppo.minibatch_size=4`, `ppo.ppo_epochs=1`, `ppo.rloo_k=4`, `ppo.clip_range=0.2`, `ppo.kl_coef=0.0`, `ppo.entropy_coef=0.0`, `ppo.max_grad_norm=1.0`, `ppo.decode_rgb=true`, `ppo.steps=99999`, `logging.log_interval=1`, `logging.save_interval=500`, `run.output_root=exps`, `run.seed=0`.
 
-- CIFAR-10
-- FFHQ64 
-- ImageNet64
-- LSUNBedroom
+## Performance Highlights
 
-The pre-trained models are available in `./exp/`.
-
-**Folder naming format:**
-`<exp_num>-<dataset_name>-<num_steps>-<NFE>-<student>-<schedule>-<afs>`
-
-**Usage:**
-
-Run sampling with:
-
-```bash
-# Generate 50K samples for FID evaluation
-torchrun --standalone --nproc_per_node=1 --master_port=22222 \
-sample.py --predictor_path=EXP_NUM --batch=128 --seeds="0-49999"
-```
-
-## Pre-trained Diffusion Models
-We perform sampling on a variaty of pre-trained diffusion models from different codebases including
-[EDM](https://github.com/NVlabs/edm), [ADM](https://github.com/openai/guided-diffusion), [Consistency models](https://github.com/openai/consistency_models), [LDM](https://github.com/CompVis/latent-diffusion) and [Stable Diffusion](https://github.com/CompVis/stable-diffusion). The tested pre-trained models are listed below:
-
-| Codebase | dataset_name | Resolusion | Pre-trained Models | Description |
-|----------|---------|------------|--------------------|-------------|
-|EDM|cifar10|32|[edm-cifar10-32x32-uncond-vp.pkl](https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-uncond-vp.pkl)
-|EDM|ffhq|64|[edm-ffhq-64x64-uncond-vp.pkl](https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-ffhq-64x64-uncond-vp.pkl)
-|EDM|afhqv2|64|[edm-afhqv2-64x64-uncond-vp.pkl](https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-afhqv2-64x64-uncond-vp.pkl)
-|EDM|imagenet64|64|[edm-imagenet-64x64-cond-adm.pkl](https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-imagenet-64x64-cond-adm.pkl)
-|Consistency Models|lsun_bedroom|256|[edm_bedroom256_ema.pt](https://openaipublic.blob.core.windows.net/consistency/edm_bedroom256_ema.pt)|Pixel-space
-|ADM|imagenet256|256|[256x256_diffusion.pt](https://openaipublic.blob.core.windows.net/diffusion/jul-2021/256x256_diffusion.pt) and [256x256_classifier.pt](https://openaipublic.blob.core.windows.net/diffusion/jul-2021/256x256_classifier.pt)|Classifier-guidance.
-|LDM|lsun_bedroom_ldm|256|[lsun_bedrooms.zip](https://ommer-lab.com/files/latent-diffusion/lsun_bedrooms.zip)|Latent-space
-|Stable Diffusion|ms_coco|512|[stable-diffusion-v1-5](https://huggingface.co/runwayml/stable-diffusion-v1-5/resolve/main/v1-5-pruned-emaonly.ckpt)|Classifier-free-guidance
-
-
-## FID Statistics
-For facilitating the FID evaluation of diffusion models, we provide our [FID statistics](https://drive.google.com/drive/folders/1f8qf5qtUewCdDrkExK_Tk5-qC-fNPKpL?usp=sharing) of various datasets. They are collected on the Internet or made by ourselves with the guidance of the [EDM](https://github.com/NVlabs/edm) codebase. 
-
-You can compute the reference statistics for your own datasets as follows:
-
-```
-python fid.py ref --data=path/to/my-dataset.zip --dest=path/to/save/my-dataset.npz
-```
+<div align="center">
+<img src="assets/performance.png" alt="T2I Performance" width="800">
+</div>
 
 ## Citation
 If you find this repository useful, please consider citing the following paper:
 
 ```
-@ inproceedings{zhu2025distilling,
-  title={Distilling Parallel Gradients for Fast ODE Solvers of Diffusion Models},
-  author={Zhu, Beier and  Wang, Ruoyu and Zhao, Tong and Zhang, Hanwang and Zhang, Chi},
-  booktitle={International Conference on Computer Vision (ICCV)},
-  year={2025}
-}
+
 ```
