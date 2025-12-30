@@ -2,7 +2,7 @@
   Parallel Diffusion Solver via<br> Residual Dirichlet Policy Optimization
 </h1>
 <div align="center">
-  <a href='https://arxiv.org'><img src='https://img.shields.io/badge/Paper%20(arXiv)-2512.xxxxx-red?logo=arxiv'></a>  &nbsp;
+  <a href='https://arxiv.org/abs/2512.22796'><img src='https://img.shields.io/badge/Paper%20(arXiv)-2512.22796-red?logo=arxiv'></a>  &nbsp;
   <a href='https://epd-solver.github.io/'><img src='https://img.shields.io/badge/Website-green?logo=homepage&logoColor=white'></a> &nbsp;
 </div>
 
@@ -172,5 +172,13 @@ Shared defaults across configs: `model.dataset_name=ms_coco`, `model.guidance_ty
 If you find this repository useful, please consider citing the following paper:
 
 ```
-
+@misc{wang2025paralleldiffusionsolverresidual,
+      title={Parallel Diffusion Solver via Residual Dirichlet Policy Optimization}, 
+      author={Ruoyu Wang and Ziyu Li and Beier Zhu and Liangyu Yuan and Hanwang Zhang and Xun Yang and Xiaojun Chang and Chi Zhang},
+      year={2025},
+      eprint={2512.22796},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2512.22796}, 
+}
 ```
