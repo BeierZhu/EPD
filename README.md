@@ -1,9 +1,13 @@
 <h1 align="center">
   Parallel Diffusion Solver via<br> Residual Dirichlet Policy Optimization
 </h1>
+
+> **Note:** This work extends EPD-Solver (ICCV 2025). You are currently in the default branch, `EPD-Solver++`. For those interested in our previous work, the original ICCV 2025 implementation is available in the `EPD-Solver` branch.
+
 <div align="center">
   <a href='https://arxiv.org/abs/2512.22796'><img src='https://img.shields.io/badge/Paper%20(arXiv)-2512.22796-red?logo=arxiv'></a>  &nbsp;
-  <a href='https://epd-solver.github.io/'><img src='https://img.shields.io/badge/Website-green?logo=homepage&logoColor=white'></a> &nbsp;
+  <a href='https://arxiv.org/abs/2507.14797'><img src='https://img.shields.io/badge/ICCV%202025%20Paper-2507.14797-red?logo=arxiv'></a>  &nbsp;
+  <a href='https://epd-solver.github.io/'><img src='https://img.shields.io/badge/Project Page-green?logo=homepage&logoColor=white'></a> &nbsp;
 </div>
 
 ## Algorithm Overview
@@ -180,5 +184,14 @@ If you find this repository useful, please consider citing the following paper:
       archivePrefix={arXiv},
       primaryClass={cs.CV},
       url={https://arxiv.org/abs/2512.22796}, 
+}
+```
+
+```
+@inproceedings{zhu2025distilling,
+      title={Distilling Parallel Gradients for Fast ODE Solvers of Diffusion Models},
+      author={Zhu, Beier and  Wang, Ruoyu and Zhao, Tong and Zhang, Hanwang and Zhang, Chi},
+      booktitle={International Conference on Computer Vision (ICCV)},
+      year={2025}
 }
 ```
