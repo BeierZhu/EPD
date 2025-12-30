@@ -173,7 +173,6 @@ Shared defaults across configs: `model.dataset_name=ms_coco`, `model.guidance_ty
 </div>
 
 ## Citation
-If you find this repository useful, please consider citing the following paper:
 
 ```
 @misc{wang2025paralleldiffusionsolverresidual,
