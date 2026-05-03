@@ -10,6 +10,8 @@
   <a href='https://epd-solver.github.io/'><img src='https://img.shields.io/badge/Project Page-green?logo=homepage&logoColor=white'></a> &nbsp;
 </div>
 
+> **News:** Our paper has been accepted to IEEE Transactions on Pattern Analysis and Machine Intelligence (TPAMI). 🎉
+
 ## Algorithm Overview
 <div align="center">
 <img src="assets/pipeline.png" alt="Training Pipeline" width="600">
