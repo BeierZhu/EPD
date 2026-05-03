@@ -5,7 +5,7 @@
 > **Note:** This work extends EPD-Solver (ICCV 2025). You are currently in the default branch, `EPD-Solver++`. For those interested in our previous work, the original ICCV 2025 implementation is available in the `EPD-Solver` branch.
 
 <div align="center">
-  <a href='https://arxiv.org/abs/2512.22796'><img src='https://img.shields.io/badge/TPAMI%20(arXiv)-2512.22796-red?logo=arxiv'></a>  &nbsp;
+  <a href='https://arxiv.org/abs/2512.22796'><img src='https://img.shields.io/badge/TPAMI%20-2512.22796-red?logo=arxiv'></a>  &nbsp;
   <a href='https://arxiv.org/abs/2507.14797'><img src='https://img.shields.io/badge/ICCV%202025%20Paper-2507.14797-red?logo=arxiv'></a>  &nbsp;
   <a href='https://epd-solver.github.io/'><img src='https://img.shields.io/badge/Project Page-green?logo=homepage&logoColor=white'></a> &nbsp;
 </div>
