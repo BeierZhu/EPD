@@ -6,6 +6,8 @@ vectors describing:
     * Position segments (K+1 values that integrate to 1.0 and recover
       monotonically increasing intermediate locations `r` via cumsum).
     * Gradient weights (K values on the simplex).
+    * Optional scale_dir / scale_time factors, modeled independently via
+      log-normal distributions in log-space.
 
 Cold-start tables (see `cold_start.py`) provide per-step Dirichlet
 concentrations which are stored as buffers and used as the policy's
@@ -20,7 +22,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributions import Dirichlet
+from torch.distributions import Dirichlet, LogNormal
 
 
 @dataclass
@@ -31,6 +33,10 @@ class PolicyOutput:
     alpha_weight: torch.Tensor  # shape: (batch, num_points)
     log_alpha_pos: torch.Tensor  # auxiliary tensor (same shape as alpha_pos)
     log_alpha_weight: torch.Tensor  # auxiliary tensor (same shape as alpha_weight)
+    scale_dir_loc: Optional[torch.Tensor] = None  # log-space mean, shape: (batch, num_points)
+    scale_dir_log_std: Optional[torch.Tensor] = None  # log-space std, shape: (batch, num_points)
+    scale_time_loc: Optional[torch.Tensor] = None  # log-space mean, shape: (batch, num_points)
+    scale_time_log_std: Optional[torch.Tensor] = None  # log-space std, shape: (batch, num_points)
 
 
 @dataclass
@@ -43,6 +49,10 @@ class PolicySample:
     log_prob: torch.Tensor  # shape: (batch,)
     entropy_pos: torch.Tensor  # shape: (batch,)
     entropy_weight: torch.Tensor  # shape: (batch,)
+    scale_dir: Optional[torch.Tensor] = None  # shape: (batch, num_points)
+    scale_time: Optional[torch.Tensor] = None  # shape: (batch, num_points)
+    entropy_scale_dir: Optional[torch.Tensor] = None  # shape: (batch,)
+    entropy_scale_time: Optional[torch.Tensor] = None  # shape: (batch,)
 
 
 class ResidualBlock(nn.Module):
@@ -84,6 +94,17 @@ class EPDParamPolicy(nn.Module):
     dirichlet_init:
         Optional cold-start Dirichlet parameters (see Stage 2). When provided,
         the policy exactly reproduces the distilled table at initialisation.
+    use_scale_dir / use_scale_time:
+        Whether to model scale_dir / scale_time with independent log-normal
+        factors (per step, per point). When enabled, the policy outputs
+        log-space means and standard deviations.
+    scale_dir_init / scale_time_init:
+        Optional baseline scale tables (shape: num_steps-1 x num_points).
+        When provided, they define the initial log-normal means.
+    scale_log_std_init:
+        Initial log-standard deviation (log space) used for scale factors.
+    scale_log_std_min / scale_log_std_max:
+        Clamp range for log-standard deviation to keep sampling stable.
     """
 
     def __init__(
@@ -95,6 +116,13 @@ class EPDParamPolicy(nn.Module):
         context_dim: int = 0,
         dirichlet_alpha_eps: float = 1e-5,
         dirichlet_init: Optional["DirichletInit"] = None,
+        use_scale_dir: bool = False,
+        use_scale_time: bool = False,
+        scale_dir_init: Optional[torch.Tensor] = None,
+        scale_time_init: Optional[torch.Tensor] = None,
+        scale_log_std_init: float = -3.0,
+        scale_log_std_min: float = -7.0,
+        scale_log_std_max: float = 2.0,
     ) -> None:
         super().__init__()
         if num_steps < 2:
@@ -107,6 +135,11 @@ class EPDParamPolicy(nn.Module):
         self.hidden_dim = hidden_dim
         self.dirichlet_alpha_eps = dirichlet_alpha_eps
         self.context_dim = context_dim
+        self.use_scale_dir = bool(use_scale_dir or scale_dir_init is not None)
+        self.use_scale_time = bool(use_scale_time or scale_time_init is not None)
+        self.scale_log_std_min = float(scale_log_std_min)
+        self.scale_log_std_max = float(scale_log_std_max)
+        self.scale_eps = 1e-6
 
         self.step_embed = nn.Embedding(num_steps - 1, hidden_dim)
         if context_dim > 0:
@@ -118,6 +151,10 @@ class EPDParamPolicy(nn.Module):
         self.blocks = nn.ModuleList(blocks)
 
         out_dim = (num_points + 1) + num_points
+        if self.use_scale_dir:
+            out_dim += 2 * num_points
+        if self.use_scale_time:
+            out_dim += 2 * num_points
         self.output_linear = nn.Linear(hidden_dim, out_dim)
         nn.init.zeros_(self.output_linear.weight)
         nn.init.zeros_(self.output_linear.bias)
@@ -126,6 +163,18 @@ class EPDParamPolicy(nn.Module):
         base_alpha_pos, base_alpha_weight = self._build_default_dirichlet(dirichlet_init)
         self.register_buffer("base_log_alpha_pos", base_alpha_pos.log())
         self.register_buffer("base_log_alpha_weight", base_alpha_weight.log())
+
+        # Baseline log-scale means/stds for scale_dir / scale_time.
+        if self.use_scale_dir:
+            base_scale_dir = self._build_default_scale(scale_dir_init, "scale_dir")
+            base_log_std_dir = torch.full_like(base_scale_dir, float(scale_log_std_init))
+            self.register_buffer("base_log_scale_dir", base_scale_dir.log())
+            self.register_buffer("base_log_std_dir", base_log_std_dir)
+        if self.use_scale_time:
+            base_scale_time = self._build_default_scale(scale_time_init, "scale_time")
+            base_log_std_time = torch.full_like(base_scale_time, float(scale_log_std_init))
+            self.register_buffer("base_log_scale_time", base_scale_time.log())
+            self.register_buffer("base_log_std_time", base_log_std_time)
 
     # ------------------------------------------------------------------ #
     # public API
@@ -163,9 +212,11 @@ class EPDParamPolicy(nn.Module):
             x = block(x)
 
         deltas = self.output_linear(x)
-        delta_pos, delta_weight = torch.split(
-            deltas, [self.num_points + 1, self.num_points], dim=-1
-        )
+        offset = 0
+        delta_pos = deltas[..., offset : offset + self.num_points + 1]
+        offset += self.num_points + 1
+        delta_weight = deltas[..., offset : offset + self.num_points]
+        offset += self.num_points
 
         base_pos = self.base_log_alpha_pos.index_select(0, step_indices)
         base_weight = self.base_log_alpha_weight.index_select(0, step_indices)
@@ -176,11 +227,43 @@ class EPDParamPolicy(nn.Module):
         alpha_pos = torch.exp(log_alpha_pos).clamp_min(self.dirichlet_alpha_eps)
         alpha_weight = torch.exp(log_alpha_weight).clamp_min(self.dirichlet_alpha_eps)
 
+        scale_dir_loc = None
+        scale_dir_log_std = None
+        if self.use_scale_dir:
+            delta_scale_dir_loc = deltas[..., offset : offset + self.num_points]
+            offset += self.num_points
+            delta_scale_dir_log_std = deltas[..., offset : offset + self.num_points]
+            offset += self.num_points
+            base_scale_dir = self.base_log_scale_dir.index_select(0, step_indices)
+            base_log_std_dir = self.base_log_std_dir.index_select(0, step_indices)
+            scale_dir_loc = base_scale_dir + delta_scale_dir_loc
+            scale_dir_log_std = (base_log_std_dir + delta_scale_dir_log_std).clamp(
+                min=self.scale_log_std_min, max=self.scale_log_std_max
+            )
+
+        scale_time_loc = None
+        scale_time_log_std = None
+        if self.use_scale_time:
+            delta_scale_time_loc = deltas[..., offset : offset + self.num_points]
+            offset += self.num_points
+            delta_scale_time_log_std = deltas[..., offset : offset + self.num_points]
+            offset += self.num_points
+            base_scale_time = self.base_log_scale_time.index_select(0, step_indices)
+            base_log_std_time = self.base_log_std_time.index_select(0, step_indices)
+            scale_time_loc = base_scale_time + delta_scale_time_loc
+            scale_time_log_std = (base_log_std_time + delta_scale_time_log_std).clamp(
+                min=self.scale_log_std_min, max=self.scale_log_std_max
+            )
+
         return PolicyOutput(
             alpha_pos=alpha_pos,
             alpha_weight=alpha_weight,
             log_alpha_pos=log_alpha_pos,
             log_alpha_weight=log_alpha_weight,
+            scale_dir_loc=scale_dir_loc,
+            scale_dir_log_std=scale_dir_log_std,
+            scale_time_loc=scale_time_loc,
+            scale_time_log_std=scale_time_log_std,
         )
 
     @torch.no_grad()
@@ -201,6 +284,24 @@ class EPDParamPolicy(nn.Module):
         positions = torch.cumsum(mean_segments[..., :-1], dim=-1)
         return positions, mean_weights
 
+    @torch.no_grad()
+    def mean_scales(
+        self, policy_output: PolicyOutput
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        Compute log-normal means for scale_dir / scale_time, if enabled.
+        """
+
+        scale_dir = None
+        scale_time = None
+        if self.use_scale_dir and policy_output.scale_dir_loc is not None:
+            dist_dir = LogNormal(policy_output.scale_dir_loc, torch.exp(policy_output.scale_dir_log_std))
+            scale_dir = dist_dir.mean
+        if self.use_scale_time and policy_output.scale_time_loc is not None:
+            dist_time = LogNormal(policy_output.scale_time_loc, torch.exp(policy_output.scale_time_log_std))
+            scale_time = dist_time.mean
+        return scale_dir, scale_time
+
     def sample_table(
         self,
         policy_output: PolicyOutput,
@@ -212,21 +313,49 @@ class EPDParamPolicy(nn.Module):
 
         dir_pos = Dirichlet(policy_output.alpha_pos)
         dir_weight = Dirichlet(policy_output.alpha_weight)
+        dir_scale_dir = None
+        dir_scale_time = None
+
+        if self.use_scale_dir and policy_output.scale_dir_loc is not None:
+            scale_dir_std = torch.exp(policy_output.scale_dir_log_std)
+            dir_scale_dir = LogNormal(policy_output.scale_dir_loc, scale_dir_std)
+        if self.use_scale_time and policy_output.scale_time_loc is not None:
+            scale_time_std = torch.exp(policy_output.scale_time_log_std)
+            dir_scale_time = LogNormal(policy_output.scale_time_loc, scale_time_std)
 
         if generator is not None:
-            torch.random.set_rng_state(generator.get_state())
-            segments = dir_pos.rsample()
-            torch.random.set_rng_state(generator.get_state())
-            weights = dir_weight.rsample()
+            # Use the provided generator for all draws while preserving the global RNG state.
+            current_state = torch.random.get_rng_state()
+            try:
+                torch.random.set_rng_state(generator.get_state())
+                segments = dir_pos.rsample()
+                weights = dir_weight.rsample()
+                scale_dir = dir_scale_dir.rsample() if dir_scale_dir is not None else None
+                scale_time = dir_scale_time.rsample() if dir_scale_time is not None else None
+                generator.set_state(torch.random.get_rng_state())
+            finally:
+                torch.random.set_rng_state(current_state)
         else:
             segments = dir_pos.rsample()
             weights = dir_weight.rsample()
+            scale_dir = dir_scale_dir.rsample() if dir_scale_dir is not None else None
+            scale_time = dir_scale_time.rsample() if dir_scale_time is not None else None
 
         positions = torch.cumsum(segments[..., :-1], dim=-1)
 
         log_prob_pos = dir_pos.log_prob(segments)
         log_prob_weight = dir_weight.log_prob(weights)
         total_log_prob = log_prob_pos + log_prob_weight
+        entropy_scale_dir = None
+        entropy_scale_time = None
+        if dir_scale_dir is not None and scale_dir is not None:
+            log_prob_scale_dir = dir_scale_dir.log_prob(scale_dir).sum(dim=-1)
+            total_log_prob = total_log_prob + log_prob_scale_dir
+            entropy_scale_dir = dir_scale_dir.entropy().sum(dim=-1)
+        if dir_scale_time is not None and scale_time is not None:
+            log_prob_scale_time = dir_scale_time.log_prob(scale_time).sum(dim=-1)
+            total_log_prob = total_log_prob + log_prob_scale_time
+            entropy_scale_time = dir_scale_time.entropy().sum(dim=-1)
 
         entropy_pos = dir_pos.entropy()
         entropy_weight = dir_weight.entropy()
@@ -241,6 +370,10 @@ class EPDParamPolicy(nn.Module):
             log_prob=total_log_prob,
             entropy_pos=entropy_pos,
             entropy_weight=entropy_weight,
+            scale_dir=scale_dir,
+            scale_time=scale_time,
+            entropy_scale_dir=entropy_scale_dir,
+            entropy_scale_time=entropy_scale_time,
         )
 
     def log_prob(
@@ -248,24 +381,46 @@ class EPDParamPolicy(nn.Module):
         policy_output: PolicyOutput,
         segments: torch.Tensor,
         weights: torch.Tensor,
+        scale_dir: Optional[torch.Tensor] = None,
+        scale_time: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Compute log-probability of provided segments/weights under the policy's
-        Dirichlet distributions.
+        Dirichlet distributions (plus optional log-normal scale factors).
         """
 
         dir_pos = Dirichlet(policy_output.alpha_pos)
         dir_weight = Dirichlet(policy_output.alpha_weight)
         log_prob_pos = dir_pos.log_prob(segments)
         log_prob_weight = dir_weight.log_prob(weights)
-        return log_prob_pos + log_prob_weight
+        total = log_prob_pos + log_prob_weight
+
+        if self.use_scale_dir and policy_output.scale_dir_loc is not None:
+            if scale_dir is None:
+                raise ValueError("scale_dir samples must be provided when use_scale_dir is True.")
+            dist_dir = LogNormal(policy_output.scale_dir_loc, torch.exp(policy_output.scale_dir_log_std))
+            total = total + dist_dir.log_prob(scale_dir).sum(dim=-1)
+        if self.use_scale_time and policy_output.scale_time_loc is not None:
+            if scale_time is None:
+                raise ValueError("scale_time samples must be provided when use_scale_time is True.")
+            dist_time = LogNormal(policy_output.scale_time_loc, torch.exp(policy_output.scale_time_log_std))
+            total = total + dist_time.log_prob(scale_time).sum(dim=-1)
+
+        return total
 
     def entropy(self, policy_output: PolicyOutput) -> torch.Tensor:
         """Return the entropy of the Dirichlet factors for diagnostic purposes."""
 
         dir_pos = Dirichlet(policy_output.alpha_pos)
         dir_weight = Dirichlet(policy_output.alpha_weight)
-        return dir_pos.entropy() + dir_weight.entropy()
+        total = dir_pos.entropy() + dir_weight.entropy()
+        if self.use_scale_dir and policy_output.scale_dir_loc is not None:
+            dist_dir = LogNormal(policy_output.scale_dir_loc, torch.exp(policy_output.scale_dir_log_std))
+            total = total + dist_dir.entropy().sum(dim=-1)
+        if self.use_scale_time and policy_output.scale_time_loc is not None:
+            dist_time = LogNormal(policy_output.scale_time_loc, torch.exp(policy_output.scale_time_log_std))
+            total = total + dist_time.entropy().sum(dim=-1)
+        return total
 
     def kl_to_base(
         self,
@@ -280,7 +435,20 @@ class EPDParamPolicy(nn.Module):
         base_alpha_pos, base_alpha_weight = self._get_base_alpha(step_indices)
         kl_pos = self._dirichlet_kl(policy_output.alpha_pos, base_alpha_pos)
         kl_weight = self._dirichlet_kl(policy_output.alpha_weight, base_alpha_weight)
-        return kl_pos + kl_weight
+        total = kl_pos + kl_weight
+
+        if self.use_scale_dir and policy_output.scale_dir_loc is not None:
+            base_loc, base_log_std = self._get_base_scale_dir(step_indices)
+            total = total + self._lognormal_kl(
+                policy_output.scale_dir_loc, policy_output.scale_dir_log_std, base_loc, base_log_std
+            )
+        if self.use_scale_time and policy_output.scale_time_loc is not None:
+            base_loc, base_log_std = self._get_base_scale_time(step_indices)
+            total = total + self._lognormal_kl(
+                policy_output.scale_time_loc, policy_output.scale_time_log_std, base_loc, base_log_std
+            )
+
+        return total
 
     @torch.no_grad()
     def load_dirichlet_init(self, dirichlet_init: "DirichletInit") -> None:
@@ -321,6 +489,23 @@ class EPDParamPolicy(nn.Module):
         alpha_weight = alpha_weight.clamp_min(self.dirichlet_alpha_eps)
         return alpha_pos, alpha_weight
 
+    def _build_default_scale(
+        self,
+        scale_init: Optional[torch.Tensor],
+        name: str,
+    ) -> torch.Tensor:
+        if scale_init is None:
+            scale = torch.ones(
+                (self.num_steps - 1, self.num_points),
+                dtype=torch.float32,
+            )
+        else:
+            scale = torch.as_tensor(scale_init, dtype=torch.float32)
+            expected = (self.num_steps - 1, self.num_points)
+            if scale.shape != expected:
+                raise ValueError(f"{name} init shape {scale.shape} does not match expected {expected}.")
+        return scale.clamp_min(self.scale_eps)
+
     def _get_base_alpha(
         self,
         step_indices: torch.Tensor,
@@ -328,6 +513,16 @@ class EPDParamPolicy(nn.Module):
         base_pos = torch.exp(self.base_log_alpha_pos.index_select(0, step_indices))
         base_weight = torch.exp(self.base_log_alpha_weight.index_select(0, step_indices))
         return base_pos, base_weight
+
+    def _get_base_scale_dir(self, step_indices: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        base_loc = self.base_log_scale_dir.index_select(0, step_indices)
+        base_log_std = self.base_log_std_dir.index_select(0, step_indices)
+        return base_loc, base_log_std
+
+    def _get_base_scale_time(self, step_indices: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        base_loc = self.base_log_scale_time.index_select(0, step_indices)
+        base_log_std = self.base_log_std_time.index_select(0, step_indices)
+        return base_loc, base_log_std
 
     @staticmethod
     def _dirichlet_kl(p_alpha: torch.Tensor, q_alpha: torch.Tensor) -> torch.Tensor:
@@ -342,6 +537,23 @@ class EPDParamPolicy(nn.Module):
         digamma_diff = torch.digamma(p_alpha) - torch.digamma(sum_p.unsqueeze(-1))
         term3 = ((p_alpha - q_alpha) * digamma_diff).sum(dim=-1)
         return term1 - term2 + term3
+
+    @staticmethod
+    def _lognormal_kl(
+        p_loc: torch.Tensor,
+        p_log_std: torch.Tensor,
+        q_loc: torch.Tensor,
+        q_log_std: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        KL divergence between log-normal distributions via their underlying normals.
+        """
+
+        p_var = torch.exp(2 * p_log_std)
+        q_var = torch.exp(2 * q_log_std)
+        diff = p_loc - q_loc
+        kl = 0.5 * ((p_var + diff.pow(2)) / q_var - 1.0 + 2.0 * (q_log_std - p_log_std))
+        return kl.sum(dim=-1)
 
     @staticmethod
     def _normalize(tensor: torch.Tensor) -> torch.Tensor:

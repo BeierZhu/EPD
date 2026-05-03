@@ -26,6 +26,8 @@ import torch.nn as nn
 from solvers import epd_sampler
 from torch_utils.download_util import check_file_by_key
 
+from .pipeline_utils import default_prompt_csv_path, load_prompts_file
+
 from .policy import EPDParamPolicy, PolicyOutput, PolicySample
 
 
@@ -130,19 +132,12 @@ def _load_prompts(prompt_csv: Optional[Path]) -> List[str]:
     if prompt_csv is not None:
         path = Path(prompt_csv)
     else:
-        prompt_path, _ = check_file_by_key("prompts")
-        path = Path(prompt_path)
-
-    prompts: List[str] = []
-    with path.open("r", encoding="utf-8") as handle:
-        reader = csv.DictReader(handle)
-        for row in reader:
-            text = row.get("text", "").strip()
-            if text:
-                prompts.append(text)
-    if not prompts:
-        raise RuntimeError(f"No prompts were loaded from {path}.")
-    return prompts
+        try:
+            path = default_prompt_csv_path()
+        except FileNotFoundError:
+            prompt_path, _ = check_file_by_key("prompts")
+            path = Path(prompt_path)
+    return load_prompts_file(path)
 
 
 def _repeat_prompts(prompts: Sequence[str], rloo_k: int) -> List[str]:
@@ -165,6 +160,8 @@ class _PolicyTableModule(nn.Module):
         self,
         positions: torch.Tensor,
         weights: torch.Tensor,
+        scale_dir: torch.Tensor,
+        scale_time: torch.Tensor,
         num_points: int,
         num_steps: int,
         schedule_type: str,
@@ -190,12 +187,15 @@ class _PolicyTableModule(nn.Module):
 
         self.register_buffer("positions", positions, persistent=False)
         self.register_buffer("weights", weights, persistent=False)
+        self.register_buffer("scale_dir_table", scale_dir, persistent=False)
+        self.register_buffer("scale_time_table", scale_time, persistent=False)
 
     def forward(self, batch_size: int, step_idx: int):
         pos = self.positions[:, step_idx].unsqueeze(-1).unsqueeze(-1)
         w = self.weights[:, step_idx].unsqueeze(-1).unsqueeze(-1)
-        ones = torch.ones_like(pos)
-        return pos, ones, ones, w
+        scale_dir = self.scale_dir_table[:, step_idx].unsqueeze(-1).unsqueeze(-1)
+        scale_time = self.scale_time_table[:, step_idx].unsqueeze(-1).unsqueeze(-1)
+        return pos, scale_dir, scale_time, w
 
 
 class PolicyPredictorAdapter(nn.Module):
@@ -217,25 +217,39 @@ class PolicyPredictorAdapter(nn.Module):
         self.schedule_type = config.schedule_type
         self.schedule_rho = config.schedule_rho
         self.afs = False
-        self.scale_dir = 0.0
-        self.scale_time = 0.0
+        self.scale_dir = 1.0 if policy_sample.scale_dir is not None else 0.0
+        self.scale_time = 1.0 if policy_sample.scale_time is not None else 0.0
         self.predict_x0 = False
         self.lower_order_final = True
         self.fcn = False
 
         positions = policy_sample.positions
         weights = policy_sample.weights
+        scale_dir = policy_sample.scale_dir
+        scale_time = policy_sample.scale_time
         if positions.dim() == 2:
             positions = positions.unsqueeze(1)
         if weights.dim() == 2:
             weights = weights.unsqueeze(1)
+        if scale_dir is None:
+            scale_dir = torch.ones_like(weights)
+        if scale_time is None:
+            scale_time = torch.ones_like(weights)
+        if scale_dir.dim() == 2:
+            scale_dir = scale_dir.unsqueeze(1)
+        if scale_time.dim() == 2:
+            scale_time = scale_time.unsqueeze(1)
 
         positions = positions.to(dtype=torch.float32)
         weights = weights.to(dtype=torch.float32)
+        scale_dir = scale_dir.to(dtype=torch.float32)
+        scale_time = scale_time.to(dtype=torch.float32)
 
         self.tables = _PolicyTableModule(
             positions,
             weights,
+            scale_dir,
+            scale_time,
             num_points=config.num_points,
             num_steps=config.num_steps,
             schedule_type=config.schedule_type,
@@ -244,6 +258,8 @@ class PolicyPredictorAdapter(nn.Module):
             guidance_type=config.guidance_type,
             guidance_rate=config.guidance_rate,
         )
+        self.tables.scale_dir = self.scale_dir
+        self.tables.scale_time = self.scale_time
 
         self.module = self.tables
 
@@ -273,7 +289,10 @@ class EPDRolloutRunner:
         self.backend_config = dict(cfg) if isinstance(cfg, dict) else {}
 
         self.prompts = _load_prompts(config.prompt_csv)
-        self.prompt_cursor = self.rank % len(self.prompts)
+        # Restore the intermediate prompt-major rollout behavior introduced in
+        # 3c58295: prompts are repeated contiguously rloo_k times, but PPO
+        # advantages are still computed with the legacy mixed baseline.
+        self.prompt_cursor = 0
         self.rloo_k = max(1, config.rloo_k)
 
         seed_value = config.rng_seed if config.rng_seed is not None else int(time.time())
@@ -292,15 +311,16 @@ class EPDRolloutRunner:
         prompts: List[str] = []
         seeds: List[int] = []
         unique_prompts = batch_size // self.rloo_k
-        start_index = self.prompt_cursor
-        for idx in range(unique_prompts):
-            prompt_index = (start_index + idx * self.world_size) % len(self.prompts)
-            prompt = self.prompts[prompt_index]
+        # Intermediate rollout semantics: sample a prompt once, then emit
+        # rloo_k seeded variants contiguously before advancing to the next
+        # prompt. This matches the state after 3c58295 but before 29987d4.
+        for _ in range(unique_prompts):
+            prompt = self.prompts[self.prompt_cursor]
+            self.prompt_cursor = (self.prompt_cursor + 1) % len(self.prompts)
             for _ in range(self.rloo_k):
                 prompts.append(prompt)
                 seed = int(self.seed_rng.randint(0, 2**32 - 1))
                 seeds.append(seed)
-        self.prompt_cursor = (start_index + unique_prompts * self.world_size) % len(self.prompts)
         return prompts, seeds
 
     def _prepare_latents(self, seeds: Sequence[int], shape: Tuple[int, ...]) -> torch.Tensor:
@@ -319,12 +339,42 @@ class EPDRolloutRunner:
         policy_output.alpha_weight = policy_output.alpha_weight.reshape(batch_size, intervals, self.config.num_points)
         policy_output.log_alpha_pos = policy_output.log_alpha_pos.reshape(batch_size, intervals, self.config.num_points + 1)
         policy_output.log_alpha_weight = policy_output.log_alpha_weight.reshape(batch_size, intervals, self.config.num_points)
+        if policy_output.scale_dir_loc is not None:
+            policy_output.scale_dir_loc = policy_output.scale_dir_loc.reshape(batch_size, intervals, self.config.num_points)
+            policy_output.scale_dir_log_std = policy_output.scale_dir_log_std.reshape(
+                batch_size, intervals, self.config.num_points
+            )
+        if policy_output.scale_time_loc is not None:
+            policy_output.scale_time_loc = policy_output.scale_time_loc.reshape(batch_size, intervals, self.config.num_points)
+            policy_output.scale_time_log_std = policy_output.scale_time_log_std.reshape(
+                batch_size, intervals, self.config.num_points
+            )
 
         flattened_output = PolicyOutput(
             alpha_pos=policy_output.alpha_pos.reshape(-1, self.config.num_points + 1),
             alpha_weight=policy_output.alpha_weight.reshape(-1, self.config.num_points),
             log_alpha_pos=policy_output.log_alpha_pos.reshape(-1, self.config.num_points + 1),
             log_alpha_weight=policy_output.log_alpha_weight.reshape(-1, self.config.num_points),
+            scale_dir_loc=(
+                policy_output.scale_dir_loc.reshape(-1, self.config.num_points)
+                if policy_output.scale_dir_loc is not None
+                else None
+            ),
+            scale_dir_log_std=(
+                policy_output.scale_dir_log_std.reshape(-1, self.config.num_points)
+                if policy_output.scale_dir_log_std is not None
+                else None
+            ),
+            scale_time_loc=(
+                policy_output.scale_time_loc.reshape(-1, self.config.num_points)
+                if policy_output.scale_time_loc is not None
+                else None
+            ),
+            scale_time_log_std=(
+                policy_output.scale_time_log_std.reshape(-1, self.config.num_points)
+                if policy_output.scale_time_log_std is not None
+                else None
+            ),
         )
 
         sample = self._policy_module.sample_table(flattened_output)
@@ -335,10 +385,18 @@ class EPDRolloutRunner:
         sample.log_prob = sample.log_prob.reshape(batch_size, intervals).sum(dim=-1)
         sample.entropy_pos = sample.entropy_pos.reshape(batch_size, intervals).sum(dim=-1)
         sample.entropy_weight = sample.entropy_weight.reshape(batch_size, intervals).sum(dim=-1)
+        if sample.scale_dir is not None:
+            sample.scale_dir = sample.scale_dir.reshape(batch_size, intervals, self.config.num_points)
+        if sample.scale_time is not None:
+            sample.scale_time = sample.scale_time.reshape(batch_size, intervals, self.config.num_points)
+        if sample.entropy_scale_dir is not None:
+            sample.entropy_scale_dir = sample.entropy_scale_dir.reshape(batch_size, intervals).sum(dim=-1)
+        if sample.entropy_scale_time is not None:
+            sample.entropy_scale_time = sample.entropy_scale_time.reshape(batch_size, intervals).sum(dim=-1)
 
         return policy_output, sample
 
-    def _prepare_conditions(self, prompts: Sequence[str]) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+    def _prepare_conditions(self, prompts: Sequence[str]) -> Tuple[Optional[object], Optional[object], Optional[torch.Tensor]]:
         condition = None
         unconditional = None
         class_labels = None
@@ -359,6 +417,15 @@ class EPDRolloutRunner:
             condition = self.net.prepare_condition(
                 prompt=prompts_list,
                 negative_prompt=negative_prompt,
+                guidance_scale=self.config.guidance_rate,
+            )
+            return condition, None, None
+        if backend_type == "flux":
+            prompts_list = list(prompts)
+            base_negative = self.backend_config.get("negative_prompt", "")
+            condition = self.net.prepare_condition(
+                prompt=prompts_list,
+                negative_prompt=base_negative,
                 guidance_scale=self.config.guidance_rate,
             )
             return condition, None, None

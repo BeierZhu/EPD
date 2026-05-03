@@ -1,112 +1,67 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/scripts/pipeline_common.sh"
+
+PROMPT_FILE="${PROMPT_FILE:-${EPD_PROMPTS_TXT_DEFAULT}}"
+SEEDS="${SEEDS:-0-999}"
+SD15_RUN_NAME="${SD15_RUN_NAME:-sd15}"
+SD3_1024_RUN_NAME="${SD3_1024_RUN_NAME:-sd3_1024}"
+FLUX_RUN_NAME="${FLUX_RUN_NAME:-flux_dev}"
+
 # RL Train
-
-## SD1.5
-torchrun --master_port=23123 --nproc_per_node=1 -m training.ppo.launch \
-    --config training/ppo/cfgs/sd15.yaml
-
-### You can replace "/path/to/local/sd3-model" with your local SD3 Medium folder or checkpoint, to avoid downloads.
-
-## SD3-Medium (512x512)
-torchrun --master_port=22222 --nproc_per_node=1 -m training.ppo.launch \
-    --config training/ppo/cfgs/sd3_512.yaml \
-    --override model.backend_options.model_name_or_path=/path/to/local/sd3-model
-
-## SD3-Medium (1024x1024)
-torchrun --master_port=12345 --nproc_per_node=1 -m training.ppo.launch \
-    --config training/ppo/cfgs/sd3_1024.yaml \
-    --override model.backend_options.model_name_or_path=/path/to/local/sd3-model
+torchrun --master_port=23123 --nproc_per_node=1 -m training.ppo.launch --config training/ppo/cfgs/sd15.yaml
+torchrun --master_port=22222 --nproc_per_node=1 -m training.ppo.launch --config training/ppo/cfgs/sd3_512.yaml
+torchrun --master_port=12345 --nproc_per_node=1 -m training.ppo.launch --config training/ppo/cfgs/sd3_1024.yaml
+./train_flux.sh
 
 # Sample
-
-## Export the EPD predictor
-python -m training.ppo.export_epd_predictor \
-    exps/[xxxxxx] \
-    --checkpoint checkpoints/policy-step[xxxxxx].pt
-
-
-## SD1.5
-MASTER_PORT=12345 python sample.py \
-    --predictor_path exps/[xxxxxx]/export/network-snapshot-export-step000005.pkl \
-    --prompt-file src/prompts/test.txt \
-    --seeds "0-999" \
+SD15_RUN_DIR="${SD15_RUN_DIR:-$(latest_run_dir "${SD15_RUN_NAME}" || true)}"
+SD15_PREDICTOR="${SD15_PREDICTOR:-}"
+if [[ -z "${SD15_PREDICTOR}" && -n "${SD15_RUN_DIR}" ]]; then
+  SD15_PREDICTOR="$(resolve_export_predictor "${SD15_RUN_DIR}" || true)"
+fi
+if [[ -n "${SD15_PREDICTOR}" ]]; then
+  MASTER_PORT=12345 python sample.py \
+    --predictor_path "${SD15_PREDICTOR}" \
+    --prompt-file "${PROMPT_FILE}" \
+    --seeds "${SEEDS}" \
     --batch 16 \
     --outdir samples/sd15
+else
+  echo "[launch.sh] Skip SD1.5 sample because no predictor was resolved." >&2
+fi
 
-MASTER_PORT=55551 python sample.py \
-    --predictor_path exps/sd15/sd15-best.pkl \
-    --prompt-file src/prompts/test.txt \
-    --seeds "0-999" \
-    --batch 16 \
-    --outdir samples/sd15
-
-## SD3-Medium
-python sample_sd3.py --predictor exps/sd3-1024/sd3-1024-best.pkl \
+SD3_1024_RUN_DIR="${SD3_1024_RUN_DIR:-$(latest_run_dir "${SD3_1024_RUN_NAME}" || true)}"
+SD3_1024_PREDICTOR="${SD3_1024_PREDICTOR:-}"
+if [[ -z "${SD3_1024_PREDICTOR}" && -n "${SD3_1024_RUN_DIR}" ]]; then
+  SD3_1024_PREDICTOR="$(resolve_export_predictor "${SD3_1024_RUN_DIR}" || true)"
+fi
+if [[ -n "${SD3_1024_PREDICTOR}" ]]; then
+  python sample_sd3.py \
+    --predictor "${SD3_1024_PREDICTOR}" \
     --seeds "0" \
-    --outdir samples/sd3 \
-    --prompt "A very big apple." \
-    --backend-config "{\"model_name_or_path\":\"/path/to/local/sd3-model\"}"
+    --outdir output_images \
+    --prompt "..."
+else
+  echo "[launch.sh] Skip SD3 sample because no predictor was resolved." >&2
+fi
 
-python sample_sd3.py --predictor exps/sd3-512/sd3-512-best.pkl \
-    --prompt-file src/prompts/test.txt \
-    --seeds "0-9" \
-    --max-batch-size 1 \
-    --outdir samples/sd3_epd_9_1024_8000 \
-    --backend-config "{\"model_name_or_path\":\"/path/to/local/sd3-model\"}"
+FLUX_RUN_DIR="${FLUX_RUN_DIR:-$(latest_run_dir "${FLUX_RUN_NAME}" || true)}"
+FLUX_PREDICTOR="${FLUX_PREDICTOR:-}"
+if [[ -z "${FLUX_PREDICTOR}" && -n "${FLUX_RUN_DIR}" ]]; then
+  FLUX_PREDICTOR="$(resolve_export_predictor "${FLUX_RUN_DIR}" || true)"
+fi
+if [[ -n "${FLUX_PREDICTOR}" ]]; then
+  python sample_flux.py \
+    --predictor "${FLUX_PREDICTOR}" \
+    --seeds "0" \
+    --outdir output_images_flux \
+    --prompt "..."
+else
+  echo "[launch.sh] Skip FLUX sample because no predictor was resolved." >&2
+fi
 
-# Evaluation 
-score_all_metrics() {
-    local name="$1"
-    if [ -z "$name" ]; then
-        echo "Usage: score_all_metrics <images_subdir_under_samples>"
-        return 1
-    fi
-
-    local image_dir="samples/${name}"
-    local prefix="${name}"
-
-    mkdir -p results
-
-    python -m training.ppo.scripts.score_clip \
-        --images "${image_dir}" \
-        --pattern "**/*.png" \
-        --prompts src/prompts/test.txt \
-        --weights weights/clip \
-        --output-json "results/${prefix}_clip.json"
-
-    python -m training.ppo.scripts.score_hps \
-        --images "${image_dir}" \
-        --pattern "**/*.png" \
-        --prompts src/prompts/test.txt \
-        --weights weights/HPS_v2.1_compressed.pt \
-        --output-json "results/${prefix}_hps.json"
-
-    python -m training.ppo.scripts.score_aesthetic \
-        --images "${image_dir}" \
-        --pattern "**/*.png" \
-        --prompts src/prompts/test.txt \
-        --weights weights/sac+logos+ava1-l14-linearMSE.pth \
-        --output-json "results/${prefix}_aesthetic.json"
-
-    python -m training.ppo.scripts.score_pick \
-        --images "${image_dir}" \
-        --pattern "**/*.png" \
-        --prompts src/prompts/test.txt \
-        --weights weights/PickScore_v1 \
-        --output-json "results/${prefix}_pick.json"
-
-    python -m training.ppo.scripts.score_imagereward \
-        --images "${image_dir}" \
-        --pattern "**/*.png" \
-        --prompts src/prompts/test.txt \
-        --weights weights/ImageReward-v1.0.pt \
-        --output-json "results/${prefix}_imagereward.json"
-
-    python -m training.ppo.scripts.score_mps \
-        --images "${image_dir}" \
-        --pattern "**/*.png" \
-        --prompts src/prompts/test.txt \
-        --weights weights/MPS_overall_checkpoint.pth \
-        --output-json "results/${prefix}_mps.json"
-}
-
-score_all_metrics ...
+# Evaluation
+# score_all_metrics sd15 "${PROMPT_FILE}"

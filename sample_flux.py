@@ -1,16 +1,10 @@
 #!/usr/bin/env python3
 """
-Minimal SD3 sampler that replays an exported EPD predictor table.
-
-Usage example:
-    python sample_sd3.py --predictor exps/fake-sd3-9/network-snapshot-000005.pkl \
-        --seeds 1 --outdir samples/test --prompt "A maglev train going vertically downward in high speed, New York Times photojournalism."
+Minimal FLUX sampler that replays an exported EPD predictor table.
 """
 
 from __future__ import annotations
 
-import csv
-import json
 import os
 import re
 from pathlib import Path
@@ -20,14 +14,14 @@ import click
 import torch
 from torchvision.utils import make_grid, save_image
 
-from sample import _prepare_sd3_condition, create_model_sd3
+from sample import _prepare_flux_condition, create_model_flux
 from training.loss import get_solver_fn
 from training.networks import EPD_predictor
-from training.ppo.pipeline_utils import load_prompts_file, resolve_predictor_path
-
-
-# -----------------------------------------------------------------------------
-# Helpers (trimmed from sample.py)
+from training.ppo.pipeline_utils import (
+    load_prompts_file,
+    resolve_flux_runtime_metadata,
+    resolve_predictor_path,
+)
 
 
 class StackedRandomGenerator:
@@ -75,10 +69,6 @@ def _load_predictor(path: Path, device: torch.device) -> EPD_predictor:
     return predictor
 
 
-# -----------------------------------------------------------------------------
-# CLI
-
-
 @click.command()
 @click.option(
     "--predictor",
@@ -86,23 +76,30 @@ def _load_predictor(path: Path, device: torch.device) -> EPD_predictor:
     required=True,
     help="EPD predictor .pkl or RL run directory.",
 )
-@click.option("--seeds", type=parse_int_list, default="0-3", show_default=True, help="Seed list/range.")
+@click.option("--seeds", type=parse_int_list, default="0", show_default=True, help="Seed list/range.")
 @click.option("--prompt", type=str, default=None, help="Single prompt for all seeds.")
 @click.option("--prompt-file", type=click.Path(exists=True, dir_okay=False), default=None, help="Text/CSV prompt file.")
-@click.option("--outdir", type=str, default="./samples/sd3_epd", show_default=True, help="Output directory.")
+@click.option(
+    "--model-id",
+    type=str,
+    default=None,
+    help="Override FLUX.1-dev model repo or local snapshot path.",
+)
+@click.option("--outdir", type=str, default="./samples/flux_epd", show_default=True, help="Output directory.")
 @click.option("--grid", is_flag=True, default=False, help="Save grid per batch.")
-@click.option("--max-batch-size", type=click.IntRange(min=1), default=4, show_default=True, help="Batch size.")
+@click.option("--max-batch-size", type=click.IntRange(min=1), default=1, show_default=True, help="Batch size.")
 @click.option(
     "--resolution",
-    type=click.Choice(["512", "1024"], case_sensitive=False),
+    type=click.Choice(["1024"], case_sensitive=False),
     default=None,
-    help="Override resolution; defaults to predictor/back-end config.",
+    help="Override resolution; FLUX v1 only supports 1024 and must match predictor metadata.",
 )
 def main(
     predictor: str,
     seeds: List[int],
     prompt: str | None,
     prompt_file: str | None,
+    model_id: str | None,
     outdir: str,
     grid: bool,
     max_batch_size: int,
@@ -113,36 +110,45 @@ def main(
     predictor_path = resolve_predictor_path(predictor)
     predictor_module = _load_predictor(predictor_path, device=device)
 
-    cli_resolution: int | None = int(resolution) if resolution is not None else None
+    cli_resolution = int(resolution) if resolution is not None else None
     predictor_resolution = getattr(predictor_module, "img_resolution", None)
     backend_cfg = {}
     if isinstance(getattr(predictor_module, "backend_config", None), dict):
         backend_cfg = dict(predictor_module.backend_config)
-    backend_cfg.setdefault("flowmatch_mu", getattr(predictor_module, "flowmatch_mu", None))
-    backend_cfg.setdefault("sigma_min", getattr(predictor_module, "sigma_min", None))
-    backend_cfg.setdefault("sigma_max", getattr(predictor_module, "sigma_max", None))
+    model_override = model_id or os.environ.get("FLUX_MODEL_PATH")
+    if model_override:
+        backend_cfg["model_name_or_path"] = model_override
+        backend_cfg["model_id"] = model_override
+    resolved_flux = resolve_flux_runtime_metadata(
+        backend_options=backend_cfg,
+        resolution=cli_resolution or predictor_resolution or backend_cfg.get("resolution"),
+        sigma_min=getattr(predictor_module, "sigma_min", None),
+        sigma_max=getattr(predictor_module, "sigma_max", None),
+        flowmatch_mu=getattr(predictor_module, "flowmatch_mu", None),
+        flowmatch_shift=getattr(predictor_module, "flowmatch_shift", None),
+    )
+    backend_cfg = dict(resolved_flux["backend_options"])
     if cli_resolution is not None and predictor_resolution is not None and cli_resolution != predictor_resolution:
         raise RuntimeError(
             f"Resolution override ({cli_resolution}) does not match predictor metadata ({predictor_resolution})."
         )
-    cfg_resolution = backend_cfg.get("resolution")
-    if cfg_resolution is not None:
-        cfg_resolution = int(cfg_resolution)
-    resolved_resolution = cli_resolution or cfg_resolution or predictor_resolution or 1024
-    backend_cfg["resolution"] = int(resolved_resolution)
+    resolved_resolution = resolved_flux["resolution"]
+    if int(resolved_resolution) != 1024:
+        raise RuntimeError(f"FLUX v1 sampler only supports resolution 1024, got {resolved_resolution}.")
+    backend_cfg["resolution"] = 1024
 
-    backend, _ = create_model_sd3(
+    backend, _ = create_model_flux(
         guidance_rate=predictor_module.guidance_rate,
+        guidance_type=predictor_module.guidance_type,
         backend_config=backend_cfg,
         device=device,
     )
 
     num_steps = predictor_module.num_steps
     schedule_type = predictor_module.schedule_type or "flowmatch"
-    sigma_min = getattr(predictor_module, "sigma_min", None) or backend.sigma_min
-    sigma_max = getattr(predictor_module, "sigma_max", None) or backend.sigma_max
+    sigma_min = float(resolved_flux["sigma_min"])
+    sigma_max = float(resolved_flux["sigma_max"])
 
-    # Log sampler configuration for reproducibility/debugging.
     sampler_config = {
         "num_steps": num_steps,
         "guidance_rate": predictor_module.guidance_rate,
@@ -150,8 +156,8 @@ def main(
         "schedule_rho": predictor_module.schedule_rho,
         "sigma_min": sigma_min,
         "sigma_max": sigma_max,
-        "flowmatch_mu": backend.resolve_flowmatch_mu(override=backend_cfg.get("flowmatch_mu")),
-        "flowmatch_shift": backend.flow_shift,
+        "flowmatch_mu": float(resolved_flux["flowmatch_mu"]),
+        "flowmatch_shift": float(resolved_flux["flowmatch_shift"]),
         "backend": backend.backend,
         "resolution": getattr(backend, "output_resolution", backend.img_resolution),
         "backend_config": backend.backend_config,
@@ -184,7 +190,7 @@ def main(
             dtype=backend.pipeline.transformer.dtype,
         )
 
-        condition = _prepare_sd3_condition(
+        condition = _prepare_flux_condition(
             backend,
             batch_prompts,
             predictor_module.guidance_rate,
@@ -226,7 +232,7 @@ def main(
 
             Image.fromarray(image_np, "RGB").save(image_path)
 
-    print("SD3 EPD sampling done.")
+    print("FLUX EPD sampling done.")
 
 
 if __name__ == "__main__":

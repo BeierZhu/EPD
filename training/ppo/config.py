@@ -9,6 +9,8 @@ from typing import Any, Dict, List, Optional
 
 import yaml
 
+from .pipeline_utils import default_prompt_csv_path, resolve_weight_path
+
 
 class ConfigError(RuntimeError):
     """Raised when configuration values are invalid."""
@@ -169,6 +171,9 @@ class PPOConfig:
     decode_rgb: bool
     steps: int
     dirichlet_concentration: float
+    scale_std: float = 0.05
+    train_scale_dir: Optional[bool] = None
+    train_scale_time: Optional[bool] = None
 
 
 @dataclass
@@ -364,13 +369,30 @@ def build_config(raw: Dict[str, Any]) -> FullConfig:
 
     reward = RewardConfig(
         type=reward_type,
-        weights_path=weights_path,
+        weights_path=resolve_weight_path("hps", weights_path) or weights_path,
         batch_size=reward_batch_size,
         enable_amp=reward_enable_amp,
         hps_version=hps_version,
         cache_dir=cache_dir,
         multi=multi_cfg,
     )
+    if reward.multi is not None:
+        image_cfg = reward.multi.imagereward
+        if image_cfg.checkpoint is not None:
+            image_cfg.checkpoint = resolve_weight_path("imagereward", image_cfg.checkpoint) or image_cfg.checkpoint
+        aesthetic_cfg = reward.multi.aesthetic
+        aesthetic_cfg.predictor_path = (
+            resolve_weight_path("aesthetic", aesthetic_cfg.predictor_path) or aesthetic_cfg.predictor_path
+        )
+        if aesthetic_cfg.clip_path is not None:
+            aesthetic_cfg.clip_path = resolve_weight_path("clip", aesthetic_cfg.clip_path) or aesthetic_cfg.clip_path
+    train_scale_dir = ppo_raw.get("train_scale_dir")
+    if train_scale_dir is not None:
+        train_scale_dir = bool(train_scale_dir)
+    train_scale_time = ppo_raw.get("train_scale_time")
+    if train_scale_time is not None:
+        train_scale_time = bool(train_scale_time)
+
     ppo = PPOConfig(
         rollout_batch_size=int(ppo_raw.get("rollout_batch_size", 4)),
         rloo_k=int(ppo_raw.get("rloo_k", 2)),
@@ -386,6 +408,9 @@ def build_config(raw: Dict[str, Any]) -> FullConfig:
         decode_rgb=bool(ppo_raw.get("decode_rgb", True)),
         steps=int(ppo_raw.get("steps", 10)),
         dirichlet_concentration=float(ppo_raw.get("dirichlet_concentration", 200.0)),
+        scale_std=float(ppo_raw.get("scale_std", 0.05)),
+        train_scale_dir=train_scale_dir,
+        train_scale_time=train_scale_time,
     )
     logging = LoggingConfig(
         log_interval=int(logging_raw.get("log_interval", 1)),
@@ -396,12 +421,23 @@ def build_config(raw: Dict[str, Any]) -> FullConfig:
 
 
 def validate_config(config: FullConfig, check_paths: bool = True) -> None:
-    if config.model.backend.lower() == "sd3":
+    backend = config.model.backend.lower()
+    if backend == "sd3":
         res = config.model.resolution
         if res is None:
             res = config.model.backend_options.get("resolution") if isinstance(config.model.backend_options, dict) else None
         if res is not None and res not in (512, 1024):
             raise ConfigError("SD3 resolution must be 512 or 1024.")
+    if backend == "flux":
+        res = config.model.resolution
+        if res is None:
+            res = config.model.backend_options.get("resolution") if isinstance(config.model.backend_options, dict) else None
+        if res is not None and int(res) != 1024:
+            raise ConfigError("FLUX resolution must be 1024.")
+        if config.model.schedule_type.lower() != "flowmatch":
+            raise ConfigError("FLUX backend requires schedule_type=flowmatch.")
+        if config.model.guidance_type.lower() != "cfg":
+            raise ConfigError("FLUX backend currently requires guidance_type=cfg.")
     if config.ppo.rollout_batch_size <= 0:
         raise ConfigError("rollout_batch_size must be positive.")
     if config.ppo.rollout_batch_size % config.ppo.rloo_k != 0:
@@ -412,13 +448,21 @@ def validate_config(config: FullConfig, check_paths: bool = True) -> None:
         raise ConfigError("reward.batch_size must be in (0, rollout_batch_size].")
     if config.ppo.steps <= 0:
         raise ConfigError("ppo.steps must be positive.")
+    if config.ppo.scale_std <= 0:
+        raise ConfigError("ppo.scale_std must be positive.")
     if check_paths:
         if not config.data.predictor_snapshot.is_file():
             raise ConfigError(f"Predictor snapshot not found: {config.data.predictor_snapshot}")
         if not config.reward.weights_path.is_file():
             raise ConfigError(f"HPS weights not found: {config.reward.weights_path}")
-        if config.data.prompt_csv and not config.data.prompt_csv.is_file():
-            raise ConfigError(f"Prompt CSV not found: {config.data.prompt_csv}")
+        prompt_path = config.data.prompt_csv
+        if prompt_path is None and config.model.dataset_name == "ms_coco":
+            try:
+                prompt_path = default_prompt_csv_path()
+            except FileNotFoundError as exc:
+                raise ConfigError(str(exc)) from exc
+        if prompt_path is not None and not prompt_path.is_file():
+            raise ConfigError(f"Prompt CSV not found: {prompt_path}")
         if config.reward.type == "multi":
             if config.reward.multi is None:
                 raise ConfigError("reward.multi must be set when reward.type=multi.")

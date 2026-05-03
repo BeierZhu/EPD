@@ -3,6 +3,8 @@ import numpy as np
 
 #----------------------------------------------------------------------------
 
+FLOWMATCH_BACKENDS = {"sd3", "flux"}
+
 def get_schedule(num_steps, sigma_min, sigma_max, device=None, schedule_type='polynomial', schedule_rho=7, net=None):
     """
     Get the time schedule for sampling.
@@ -49,10 +51,10 @@ def get_schedule(num_steps, sigma_min, sigma_max, device=None, schedule_type='po
         t_steps_temp = (t_steps_max + step_indices / (num_steps - 1) * (t_steps_min ** (1 / schedule_rho) - t_steps_max)) ** schedule_rho
         t_steps = base_net.sigma(t_steps_temp)
     elif schedule_type == 'flowmatch':
-        if base_net is None or getattr(base_net, "backend", None) != "sd3":
-            raise ValueError("flowmatch schedule requires an SD3 backend instance.")
+        if base_net is None or getattr(base_net, "backend", None) not in FLOWMATCH_BACKENDS:
+            raise ValueError("flowmatch schedule requires a flow-matching backend instance.")
         if not hasattr(base_net, "make_flowmatch_schedule"):
-            raise ValueError("SD3 backend does not expose make_flowmatch_schedule.")
+            raise ValueError("Selected flow-matching backend does not expose make_flowmatch_schedule.")
         t_steps = base_net.make_flowmatch_schedule(num_steps, device=device)
     else:
         raise ValueError("Got wrong schedule type {}".format(schedule_type))

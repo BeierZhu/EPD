@@ -10,12 +10,21 @@ import PIL.Image
 import dnnlib
 import json
 from torch import autocast
+from contextlib import nullcontext
 from torch_utils import distributed as dist
 from torchvision.utils import make_grid, save_image
 from torch_utils.download_util import check_file_by_key
 from training.loss import get_solver_fn
 import torchvision
 import torchvision.transforms as transforms
+from training.ppo.pipeline_utils import (
+    bootstrap_local_diffusers,
+    bootstrap_local_taming,
+    default_prompt_csv_path,
+    load_prompts_file,
+    resolve_flux_runtime_metadata,
+    resolve_predictor_path,
+)
 #----------------------------------------------------------------------------
 # Wrapper for torch.Generator that allows specifying a different random seed
 # for each sample in a minibatch.
@@ -57,6 +66,7 @@ def parse_int_list(s):
 # and Stable Diffusion codebase (https://github.com/CompVis/stable-diffusion)
 
 def load_ldm_model(config, ckpt, verbose=False):
+    bootstrap_local_taming()
     from models.ldm.util import instantiate_from_config
     pl_sd = torch.load(ckpt, map_location="cpu", weights_only=False)
     if "global_step" in pl_sd:
@@ -74,24 +84,26 @@ def load_ldm_model(config, ckpt, verbose=False):
 
 #----------------------------------------------------------------------------
 
-def create_model(dataset_name=None, guidance_type=None, guidance_rate=None, device=None):
-    """Load the Stable Diffusion 1.5 backbone used across RLEPD."""
+def create_model(dataset_name=None, guidance_type=None, guidance_rate=None, device=None, model_path=None):
+    """Load the Stable Diffusion 1.5 backbone used across EPD."""
 
     if dataset_name not in [None, "ms_coco"]:
-        raise ValueError("This trimmed RLEPD build only supports dataset_name='ms_coco'.")
+        raise ValueError("This trimmed EPD build only supports dataset_name='ms_coco'.")
     if guidance_type not in [None, "cfg"]:
         raise ValueError("Stable Diffusion fine-tuning requires classifier-free guidance (cfg).")
     if guidance_rate is None:
         raise ValueError("guidance_rate must be provided for cfg sampling.")
 
-    model_path, _ = check_file_by_key("ms_coco")
-    dist.print0(f'Loading the pre-trained diffusion model from "{model_path}"...')
+    resolved_model_path = model_path
+    if resolved_model_path is None:
+        resolved_model_path, _ = check_file_by_key("ms_coco")
+    dist.print0(f'Loading the pre-trained diffusion model from "{resolved_model_path}"...')
 
     from omegaconf import OmegaConf
     from models.networks_edm import CFGPrecond
 
     config = OmegaConf.load("./models/ldm/configs/stable-diffusion/v1-inference.yaml")
-    net = load_ldm_model(config, model_path)
+    net = load_ldm_model(config, resolved_model_path)
     net = CFGPrecond(
         net,
         img_resolution=64,
@@ -129,6 +141,7 @@ def create_model_sd3(
     device=None,
     backend_config=None,
 ):
+    bootstrap_local_diffusers()
     if guidance_rate is None:
         raise ValueError("guidance_rate must be provided for SD3 sampling.")
     cfg = dict(backend_config) if isinstance(backend_config, dict) else {}
@@ -172,6 +185,77 @@ def create_model_sd3(
     return backend, "sd3"
 
 
+def create_model_flux(
+    dataset_name=None,
+    guidance_type=None,
+    guidance_rate=None,
+    device=None,
+    backend_config=None,
+):
+    bootstrap_local_diffusers()
+    if dataset_name not in [None, "ms_coco"]:
+        raise ValueError("This trimmed EPD build only supports dataset_name='ms_coco'.")
+    if guidance_type not in [None, "cfg"]:
+        raise ValueError("FLUX fine-tuning currently expects guidance_type='cfg'.")
+    if guidance_rate is None:
+        raise ValueError("guidance_rate must be provided for FLUX sampling.")
+
+    cfg = dict(backend_config) if isinstance(backend_config, dict) else {}
+    resolved = resolve_flux_runtime_metadata(
+        backend_options=cfg,
+        resolution=cfg.get("resolution"),
+        sigma_min=cfg.get("sigma_min"),
+        sigma_max=cfg.get("sigma_max"),
+        flowmatch_mu=cfg.get("flowmatch_mu"),
+        flowmatch_shift=cfg.get("flowmatch_shift"),
+    )
+    cfg = dict(resolved["backend_options"])
+    model_id = cfg["model_name_or_path"]
+    torch_dtype = _resolve_torch_dtype(
+        cfg.get("torch_dtype", "bfloat16"),
+        device if isinstance(device, torch.device) else torch.device(device),
+    )
+    enable_offload = bool(cfg.get("enable_model_cpu_offload", False))
+    revision = cfg.get("revision")
+    variant = cfg.get("variant")
+    use_safetensors = cfg.get("use_safetensors", True)
+    token = cfg.get("token")
+    resolution = int(cfg.get("resolution", 1024) or 1024)
+    if resolution != 1024:
+        raise ValueError(f"FLUX resolution must be 1024 in this checkout, got {resolution}")
+    pipeline_kwargs = cfg.get("pipeline_kwargs") if isinstance(cfg.get("pipeline_kwargs"), dict) else None
+    flowmatch_mu = cfg.get("flowmatch_mu")
+
+    from models.backends import FluxDiffusersBackend
+
+    backend = FluxDiffusersBackend(
+        model_name_or_path=model_id,
+        device=device,
+        torch_dtype=torch_dtype,
+        guidance_scale=guidance_rate,
+        enable_model_cpu_offload=enable_offload,
+        revision=revision,
+        variant=variant,
+        use_safetensors=use_safetensors,
+        token=token,
+        pipeline_kwargs=pipeline_kwargs,
+        flowmatch_mu=flowmatch_mu,
+        resolution=resolution,
+    )
+    backend.backend_config = dict(cfg)
+    backend.backend_config["model_name_or_path"] = model_id
+    backend.backend_config["model_id"] = model_id
+    backend.backend_config["torch_dtype"] = str(torch_dtype).replace("torch.", "")
+    backend.backend_config["enable_model_cpu_offload"] = enable_offload
+    backend.backend_config["flowmatch_mu"] = float(backend.resolve_flowmatch_mu())
+    backend.backend_config["flowmatch_shift"] = float(backend.flow_shift)
+    backend.backend_config["sigma_min"] = float(backend.sigma_min)
+    backend.backend_config["sigma_max"] = float(backend.sigma_max)
+    backend.backend_config["resolution"] = resolution
+    backend.backend_config["latent_resolution"] = getattr(backend, "latent_resolution", None)
+    return backend, "flux"
+
+
 def _prepare_sd3_condition(net, prompts, guidance_rate, backend_config):
     prompts_list = list(prompts)
     if guidance_rate == 1.0:
@@ -191,6 +275,21 @@ def _prepare_sd3_condition(net, prompts, guidance_rate, backend_config):
     )
 
 
+def _prepare_flux_condition(net, prompts, guidance_rate, backend_config):
+    prompts_list = list(prompts)
+    base_negative = backend_config.get("negative_prompt", "")
+    if isinstance(base_negative, list):
+        if any(str(item).strip() for item in base_negative):
+            raise ValueError("FLUX v1 integration does not support non-empty negative_prompt lists.")
+    elif base_negative is not None and str(base_negative).strip():
+        raise ValueError("FLUX v1 integration does not support non-empty negative_prompt.")
+    return net.prepare_condition(
+        prompt=prompts_list,
+        negative_prompt=base_negative,
+        guidance_scale=guidance_rate,
+    )
+
+
 def create_model_backend(
     dataset_name=None,
     guidance_type=None,
@@ -198,6 +297,7 @@ def create_model_backend(
     backend="ldm",
     backend_config=None,
     device=None,
+    model_path=None,
 ):
     backend = (backend or "ldm").lower()
     if backend == "sd3":
@@ -208,7 +308,15 @@ def create_model_backend(
             device=device,
             backend_config=backend_config,
         )
-    return create_model(dataset_name, guidance_type, guidance_rate, device)
+    if backend == "flux":
+        return create_model_flux(
+            dataset_name=dataset_name,
+            guidance_type=guidance_type,
+            guidance_rate=guidance_rate,
+            device=device,
+            backend_config=backend_config,
+        )
+    return create_model(dataset_name, guidance_type, guidance_rate, device, model_path=model_path)
 
 #----------------------------------------------------------------------------
 
@@ -250,6 +358,7 @@ def main(
 ):
 
     dist.init()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     num_batches = ((len(seeds) - 1) // (max_batch_size * dist.get_world_size()) + 1) * dist.get_world_size()
     all_batches = torch.as_tensor(seeds).tensor_split(num_batches)
     rank_batches = all_batches[dist.get_rank() :: dist.get_world_size()]
@@ -259,21 +368,7 @@ def main(
         torch.distributed.barrier()     # rank 0 goes first
 
     # Load predictor
-    if not predictor_path.endswith('pkl'):      # load by experiment number
-        # find the directory with trained predictor
-        predictor_path_str = '0' * (5 - len(predictor_path)) + predictor_path
-        for file_name in os.listdir("./exps"):
-            if file_name.split('-')[0] == predictor_path_str:
-                file_list = [f for f in os.listdir(os.path.join('./exps', file_name)) if f.endswith("pkl")]
-                max_index = -1
-                max_file = None
-                for ckpt_name in file_list:
-                    file_index = int(ckpt_name.split("-")[-1].split(".")[0])
-                    if file_index > max_index:
-                        max_index = file_index
-                        max_file = ckpt_name
-                predictor_path = os.path.join('./exps', file_name, max_file)
-                break
+    predictor_path = str(resolve_predictor_path(predictor_path))
     dist.print0(f'Loading predictor from "{predictor_path}"...')
     with dnnlib.util.open_url(predictor_path, verbose=(dist.get_rank() == 0)) as f:
         predictor = pickle.load(f)['model'].to(device)
@@ -324,6 +419,12 @@ def main(
     resolved_backend = user_backend or predictor_backend
     merged_backend_config = base_backend_config
     merged_backend_config.update(backend_config_override)
+    if solver_kwargs.get('model_path'):
+        if resolved_backend in {'sd3', 'flux'}:
+            merged_backend_config['model_name_or_path'] = solver_kwargs['model_path']
+            merged_backend_config['model_id'] = solver_kwargs['model_path']
+        else:
+            solver_kwargs['model_path'] = os.path.expanduser(solver_kwargs['model_path'])
     solver_kwargs['backend'] = resolved_backend
     solver_kwargs['backend_config'] = merged_backend_config
 
@@ -336,6 +437,7 @@ def main(
         backend=resolved_backend,
         backend_config=merged_backend_config,
         device=device,
+        model_path=solver_kwargs.get('model_path'),
     )
     # TODO: support mixed precision 
     # net.use_fp16 = solver_kwargs['use_fp16']
@@ -355,23 +457,13 @@ def main(
     # Load the prompts
     sample_captions = None
     if prompt_file and solver_kwargs['prompt'] is None:
-        with open(prompt_file, 'r', encoding='utf-8') as file:
-            lines = [line.strip() for line in file if line.strip()]
-        if not lines:
-            raise RuntimeError(f"No prompts found in '{prompt_file}'.")
-        sample_captions = lines
+        sample_captions = load_prompts_file(prompt_file)
     elif dataset_name in ['ms_coco'] and solver_kwargs['prompt'] is None:
-        # Loading MS-COCO captions for FID-30k evaluaion
-        # We use the selected 30k captions from https://github.com/boomb0om/text2image-benchmark
-        prompt_path, _ = check_file_by_key('prompts')
-        sample_captions = []
-        with open(prompt_path, 'r', encoding='utf-8') as file:
-            reader = csv.DictReader(file)
-            for row in reader:
-                text = row['text']
-                sample_captions.append(text)
-        if not sample_captions:
-            raise RuntimeError(f"No prompts found in '{prompt_path}'.")
+        try:
+            prompt_path = default_prompt_csv_path()
+        except FileNotFoundError:
+            prompt_path, _ = check_file_by_key('prompts')
+        sample_captions = load_prompts_file(prompt_path)
 
     # Construct solver
     sampler_fn = get_solver_fn(solver)
@@ -389,6 +481,8 @@ def main(
         elif key in ['prompt'] and dataset_name not in ['ms_coco']:
             continue
         dist.print0(f"\t{key}: {value}")
+    if solver_kwargs.get('return_inters'):
+        dist.print0("Warning: --return_inters is accepted for compatibility and decodes only the final latent state.")
 
     # Loop over batches.
     if outdir is None:
@@ -450,24 +544,34 @@ def main(
                 solver_kwargs['guidance_rate'],
                 merged_backend_config,
             )
+        elif solver_kwargs['model_source'] == 'flux':
+            condition_payload = _prepare_flux_condition(
+                net,
+                prompts,
+                solver_kwargs['guidance_rate'],
+                merged_backend_config,
+            )
 
         # Generate images.
         with torch.no_grad():
             if solver_kwargs['model_source'] == 'ldm':
-                with autocast("cuda"):
+                autocast_ctx = autocast("cuda") if solver_kwargs.get('use_fp16') and device.type == 'cuda' else nullcontext()
+                with autocast_ctx:
                     with net.model.ema_scope():
                         call_kwargs = dict(solver_kwargs)
                         call_kwargs.update(condition=c, unconditional_condition=uc)
                         if batch_id == 0:
                             call_kwargs['verbose'] = True
-                        images, _ = sampler_fn(net, latents, **call_kwargs)
+                        output = sampler_fn(net, latents, **call_kwargs)
+                        images = output[-1] if call_kwargs.get('return_inters') else output[0]
                         images = net.model.decode_first_stage(images)
-            elif solver_kwargs['model_source'] == 'sd3':
+            elif solver_kwargs['model_source'] in {'sd3', 'flux'}:
                 call_kwargs = dict(solver_kwargs)
                 call_kwargs['condition'] = condition_payload
                 if batch_id == 0:
                     call_kwargs['verbose'] = True
-                images, _ = sampler_fn(net, latents, **call_kwargs)
+                output = sampler_fn(net, latents, **call_kwargs)
+                images = output[-1] if call_kwargs.get('return_inters') else output[0]
                 images = net.vae_decode(images)
             else:
                 call_kwargs = dict(solver_kwargs)
@@ -475,15 +579,16 @@ def main(
                 call_kwargs['nums_steps'] = solver_kwargs['num_steps']
                 if batch_id == 0:
                     call_kwargs['verbose'] = True
-                images, _ = sampler_fn(net, latents, **call_kwargs)
-        
+                output = sampler_fn(net, latents, **call_kwargs)
+                images = output[-1] if call_kwargs.get('return_inters') else output[0]
+
         # Save images.
         if grid:
             images = torch.clamp(images / 2 + 0.5, 0, 1)
             os.makedirs(outdir, exist_ok=True)
             nrows = int(images.shape[0] ** 0.5)
             image_grid = make_grid(images, nrows, padding=0)
-            save_image(image_grid, os.path.join(outdir, "grid.png"))
+            save_image(image_grid, os.path.join(outdir, f"grid_batch{batch_id:04d}.png"))
         else:
             images_np = (images * 127.5 + 128).clip(0, 255).to(torch.uint8).permute(0, 2, 3, 1).cpu().numpy()
             for seed, image_np in zip(batch_seeds, images_np):
@@ -507,12 +612,12 @@ if __name__ == "__main__":
 '''
 
 MASTER_ADDR=127.0.0.1 MASTER_PORT=29610 python sample.py \
-    --predictor_path exps/00036-ms_coco-10-36-epd-dpm-1-discrete/network-snapshot-000005.pkl \
+    --predictor_path exps/sd15/sd15-distilled.pkl \
     --seeds 0-3 --batch 2 --seeds "0-10" \
     --outdir ./samples/origin
 
 MASTER_ADDR=127.0.0.1 MASTER_PORT=29610 python sample.py \
-    --predictor_path exps/20251030-215325-sd15_rl_base/export/network-snapshot-export-step000040.pkl \
+    --predictor_path exps/sd15/sd15-best.pkl \
     --seeds 0-3 --batch 2 --seeds "0-10" \
     --outdir ./samples/rl
 

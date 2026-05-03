@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import random
 import sys
@@ -17,10 +18,9 @@ from torch.nn.parallel import DistributedDataParallel
 
 from . import config as cfg
 from .cold_start import build_dirichlet_params, load_predictor_table
+from .pipeline_utils import resolve_flux_runtime_metadata
 from .policy import EPDParamPolicy
 from .ppo_trainer import PPOTrainer, PPOTrainerConfig
-from .reward_hps import RewardHPS, RewardHPSConfig
-from .reward_multi import RewardMetricWeights, RewardMultiMetric, RewardMultiMetricConfig, RewardMultiMetricPaths
 from .rl_runner import EPDRolloutRunner, RLRunnerConfig
 
 
@@ -95,7 +95,7 @@ def save_policy_checkpoint(
     step: int,
 ) -> Path:
     """
-    Persist policy weights to checkpoints/policy-stepXXXXXX.pt.
+    Persist policy 权重到 checkpoints/policy-stepXXXXXX.pt。
     """
 
     if run_config.run_dir is None:
@@ -215,8 +215,11 @@ def main(argv: Optional[List[str]] = None) -> None:
             raw.setdefault("ppo", {})["steps"] = args.max_steps
         full_config = cfg.build_config(raw)
         meta = enrich_model_dimensions(full_config, dry_run=args.dry_run)
-        cfg.validate_config(full_config, check_paths=not args.dry_run)
+        cfg.validate_config(full_config, check_paths=True)
     except cfg.ConfigError as err:
+        print(f"[ConfigError] {err}", file=sys.stderr)
+        sys.exit(1)
+    except FileNotFoundError as err:
         print(f"[ConfigError] {err}", file=sys.stderr)
         sys.exit(1)
 
@@ -262,12 +265,30 @@ def main(argv: Optional[List[str]] = None) -> None:
             predictor_table,
             concentration=full_config.ppo.dirichlet_concentration,
         )
+        scale_dir_init = predictor_table.scale_dir
+        scale_time_init = predictor_table.scale_time
+        use_scale_dir = scale_dir_init is not None
+        use_scale_time = scale_time_init is not None
+        if full_config.ppo.train_scale_dir is not None:
+            use_scale_dir = full_config.ppo.train_scale_dir
+            if not use_scale_dir:
+                scale_dir_init = None
+        if full_config.ppo.train_scale_time is not None:
+            use_scale_time = full_config.ppo.train_scale_time
+            if not use_scale_time:
+                scale_time_init = None
+
         policy = EPDParamPolicy(
             num_steps=predictor_table.num_steps,
             num_points=predictor_table.num_points,
             hidden_dim=128,
             num_layers=2,
             dirichlet_init=dirichlet_init,
+            use_scale_dir=use_scale_dir,
+            use_scale_time=use_scale_time,
+            scale_dir_init=scale_dir_init,
+            scale_time_init=scale_time_init,
+            scale_log_std_init=math.log(full_config.ppo.scale_std),
         ).to(device)
 
         if distributed:
@@ -300,10 +321,44 @@ def main(argv: Optional[List[str]] = None) -> None:
             device=device,
         )
         full_config.model.backend_options = backend_config
+        if str(full_config.model.backend).lower() == "flux":
+            resolved_flux = resolve_flux_runtime_metadata(
+                backend_options=backend_config,
+                resolution=full_config.model.resolution or getattr(net, "output_resolution", None),
+                sigma_min=full_config.model.sigma_min if full_config.model.sigma_min is not None else getattr(net, "sigma_min", None),
+                sigma_max=full_config.model.sigma_max if full_config.model.sigma_max is not None else getattr(net, "sigma_max", None),
+                flowmatch_mu=(
+                    full_config.model.flowmatch_mu
+                    if full_config.model.flowmatch_mu is not None
+                    else getattr(net, "default_flowmatch_mu", None)
+                ),
+                flowmatch_shift=(
+                    full_config.model.flowmatch_shift
+                    if full_config.model.flowmatch_shift is not None
+                    else getattr(net, "flow_shift", None)
+                ),
+            )
+            full_config.model.resolution = resolved_flux["resolution"]
+            full_config.model.sigma_min = resolved_flux["sigma_min"]
+            full_config.model.sigma_max = resolved_flux["sigma_max"]
+            full_config.model.flowmatch_mu = resolved_flux["flowmatch_mu"]
+            full_config.model.flowmatch_shift = resolved_flux["flowmatch_shift"]
+            full_config.model.backend_options = dict(resolved_flux["backend_options"])
+            backend_config = dict(full_config.model.backend_options)
+        if is_master:
+            save_config_snapshot(full_config)
         if is_master:
             print("[Launch] Stable Diffusion model loaded.")
         net = net.to(device)
         net.eval()
+
+        from .reward_hps import RewardHPS, RewardHPSConfig
+        from .reward_multi import (
+            RewardMetricWeights,
+            RewardMultiMetric,
+            RewardMultiMetricConfig,
+            RewardMultiMetricPaths,
+        )
 
         hps_cfg = RewardHPSConfig(
             device=device,
@@ -446,7 +501,7 @@ if __name__ == "__main__":  # pragma: no cover
 
 '''
 
-Check whether the config matches the cold-start distillation table parameters
+看一下配置是否符合冷启动蒸馏表参数
 python -m training.ppo.launch --dry-run
 
 '''

@@ -2,7 +2,7 @@
 SD3 backend adapter that wraps the official diffusers pipeline.
 
 The adapter keeps all diffusers-specific logic (prompt encoding, CFG,
-VAE decode, etc.) inside a single module so that the rest of the RLEPD
+VAE decode, etc.) inside a single module so that the rest of the EPD
 codebase can keep using the classic `(net(x, t, condition=..., ...))`
 interface.
 """
@@ -62,7 +62,7 @@ class SD3DiffusersBackend(nn.Module):
     Thin adapter over StableDiffusion3Pipeline.
 
     Parameters mirror the official pipeline so that any later options
-    (LoRA, IP-adapter, etc.) can be forwarded without touching RLEPD
+    (LoRA, IP-adapter, etc.) can be forwarded without touching EPD
     solver code.
     """
 

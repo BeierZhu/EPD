@@ -4,7 +4,7 @@ Stage 6: PPO trainer integrating policy, rollout runner, and HPS rewards.
 This module provides a lightweight implementation of PPO with RLOO
 advantage estimation tailored to the EPD solver setting. The design takes
 inspiration from TPDM's trainer but avoids external dependencies so it can
-operate entirely within the existing RLEPD codebase.
+operate entirely within the existing EPD codebase.
 """
 
 from __future__ import annotations
@@ -181,8 +181,11 @@ class PPOTrainer:
         if k == 1:
             advantages = rewards.clone()
         else:
-            num_prompts = rewards.numel() // k
-            reshaped = rewards.view(k, num_prompts)
+            num_groups = rewards.numel() // k
+            # Legacy mixed-prompt baseline mode: rewards arrive in sample-major
+            # order, so reshaping as (k, num_groups) intentionally mixes
+            # different prompts within each leave-one-out column.
+            reshaped = rewards.view(k, num_groups)
             baseline = (reshaped.sum(dim=0, keepdim=True) - reshaped) / (k - 1)
             advantages = (reshaped - baseline).reshape(-1)
 
@@ -202,6 +205,8 @@ class PPOTrainer:
         step_indices = batch.step_indices.to(self._device)
         segments = policy_sample.segments.to(self._device).detach()
         weights = policy_sample.weights.to(self._device).detach()
+        scale_dir = policy_sample.scale_dir.to(self._device).detach() if policy_sample.scale_dir is not None else None
+        scale_time = policy_sample.scale_time.to(self._device).detach() if policy_sample.scale_time is not None else None
         old_log_prob = batch.log_prob.to(self._device).detach()
         advantages = advantages.detach()
 
@@ -214,6 +219,16 @@ class PPOTrainer:
         base_alpha_weight = torch.exp(
             self._policy_module.base_log_alpha_weight.index_select(0, step_indices)
         )
+        base_log_scale_dir = None
+        base_log_std_dir = None
+        if getattr(self._policy_module, "use_scale_dir", False):
+            base_log_scale_dir = self._policy_module.base_log_scale_dir.index_select(0, step_indices)
+            base_log_std_dir = self._policy_module.base_log_std_dir.index_select(0, step_indices)
+        base_log_scale_time = None
+        base_log_std_time = None
+        if getattr(self._policy_module, "use_scale_time", False):
+            base_log_scale_time = self._policy_module.base_log_scale_time.index_select(0, step_indices)
+            base_log_std_time = self._policy_module.base_log_std_time.index_select(0, step_indices)
 
         stats_accum = {
             "loss": 0.0,
@@ -236,8 +251,14 @@ class PPOTrainer:
                     step_indices,
                     segments,
                     weights,
+                    scale_dir,
+                    scale_time,
                     base_alpha_pos,
                     base_alpha_weight,
+                    base_log_scale_dir,
+                    base_log_std_dir,
+                    base_log_scale_time,
+                    base_log_std_time,
                     old_log_prob,
                     advantages,
                 )
@@ -256,8 +277,14 @@ class PPOTrainer:
         step_indices: torch.Tensor,
         segments: torch.Tensor,
         weights: torch.Tensor,
+        scale_dir: Optional[torch.Tensor],
+        scale_time: Optional[torch.Tensor],
         base_alpha_pos: torch.Tensor,
         base_alpha_weight: torch.Tensor,
+        base_log_scale_dir: Optional[torch.Tensor],
+        base_log_std_dir: Optional[torch.Tensor],
+        base_log_scale_time: Optional[torch.Tensor],
+        base_log_std_time: Optional[torch.Tensor],
         old_log_prob: torch.Tensor,
         advantages: torch.Tensor,
     ) -> Dict[str, float]:
@@ -267,6 +294,8 @@ class PPOTrainer:
 
         mb_segments = segments.index_select(0, mb_indices)
         mb_weights = weights.index_select(0, mb_indices)
+        mb_scale_dir = scale_dir.index_select(0, mb_indices) if scale_dir is not None else None
+        mb_scale_time = scale_time.index_select(0, mb_indices) if scale_time is not None else None
         mb_advantages = advantages.index_select(0, mb_indices)
         mb_old_logprob = old_log_prob.index_select(0, mb_indices)
 
@@ -275,8 +304,12 @@ class PPOTrainer:
 
         flat_segments = mb_segments.reshape(-1, num_points + 1)
         flat_weights = mb_weights.reshape(-1, num_points)
+        flat_scale_dir = mb_scale_dir.reshape(-1, num_points) if mb_scale_dir is not None else None
+        flat_scale_time = mb_scale_time.reshape(-1, num_points) if mb_scale_time is not None else None
 
-        new_logprob_flat = self._policy_module.log_prob(flat_output, flat_segments, flat_weights)
+        new_logprob_flat = self._policy_module.log_prob(
+            flat_output, flat_segments, flat_weights, flat_scale_dir, flat_scale_time
+        )
         new_logprob = new_logprob_flat.view(mb_size, intervals).sum(dim=-1)
 
         ratio = torch.exp(new_logprob - mb_old_logprob)
@@ -291,6 +324,18 @@ class PPOTrainer:
         kl_flat = self._policy_module._dirichlet_kl(flat_output.alpha_pos, ref_alpha_pos) + self._policy_module._dirichlet_kl(
             flat_output.alpha_weight, ref_alpha_weight
         )
+        if base_log_scale_dir is not None and flat_output.scale_dir_loc is not None:
+            ref_log_scale_dir = base_log_scale_dir.unsqueeze(0).repeat(mb_size, 1, 1).reshape(-1, num_points)
+            ref_log_std_dir = base_log_std_dir.unsqueeze(0).repeat(mb_size, 1, 1).reshape(-1, num_points)
+            kl_flat = kl_flat + self._policy_module._lognormal_kl(
+                flat_output.scale_dir_loc, flat_output.scale_dir_log_std, ref_log_scale_dir, ref_log_std_dir
+            )
+        if base_log_scale_time is not None and flat_output.scale_time_loc is not None:
+            ref_log_scale_time = base_log_scale_time.unsqueeze(0).repeat(mb_size, 1, 1).reshape(-1, num_points)
+            ref_log_std_time = base_log_std_time.unsqueeze(0).repeat(mb_size, 1, 1).reshape(-1, num_points)
+            kl_flat = kl_flat + self._policy_module._lognormal_kl(
+                flat_output.scale_time_loc, flat_output.scale_time_log_std, ref_log_scale_time, ref_log_std_time
+            )
         kl = kl_flat.view(mb_size, intervals).sum(dim=-1)
         kl_mean = kl.mean()
 
