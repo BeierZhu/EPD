@@ -122,12 +122,6 @@ python sample_flux.py --predictor exps/flux/flux-best.pkl \
   --prompt-file src/prompts/test.txt \
   --seeds "0" \
   --outdir samples/flux
-
-## FLUX.1-dev baseline
-python sample_flux_baseline.py --sampler flux \
-  --model-id /path/to/local/FLUX.1-dev \
-  --prompt "A very big apple." \
-  --seeds "0"
 ```
 
 ### Evaluation
@@ -185,7 +179,6 @@ We provide six metrics to evaluate generated images: **HPSv2.1, PickScore, Image
 - FLUX support is fixed to `1024x1024`, `schedule_type=flowmatch`, and embedded guidance scale `3.5`.
 - The sampling scripts resolve FLUX locally first via `FLUX_MODEL_PATH` or the Hugging Face cache, then fall back to the Hugging Face repo id. Set `FLUX_ALLOW_REMOTE=1` when intentionally loading the gated Hugging Face repo instead of a local snapshot.
 - `exps/flux/flux-best.pkl` is the released RL-best inference checkpoint. FLUX training starts from `exps/flux/flux-start.pkl`, a manually initialized start table that `train_flux.sh` uses directly before PPO launch.
-- The official FLUX Euler baseline is available with `sample_flux_baseline.py --sampler flux`.
 
 **Solver metadata (read from predictor checkpoints)**
 
