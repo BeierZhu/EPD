@@ -1,5 +1,5 @@
 <h1 align="center">
-  Parallel Diffusion Solver via<br> Residual Dirichlet Policy Optimization
+  [TPAMI] Parallel Diffusion Solver via<br> Residual Dirichlet Policy Optimization
 </h1>
 
 <p align="center">
